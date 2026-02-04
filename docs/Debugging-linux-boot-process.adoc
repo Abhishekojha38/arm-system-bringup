@@ -1,22 +1,40 @@
+= 📚 Debugging Linux Boot Process
+:toc:
+:toclevels: 4
+:toc-title: Table of Contents
+:icons: font
+:source-highlighter: highlightjs
+:numbered:
+:imagesdir: ../images
 
-= Debugging Linux Boot Process
+[abstract]
+This document is about understanding how to decompress the kernel, load it into memory, and execute it. We build the QEMU ARM image by following the steps given in the `link:https://github.com/Abhishekojha38/yocto-playground.git[yocto-playground]` repository.
 
-This document is about understanding how decompress the kernel and load it into memory and execute it. We build the qemu arm image by following the steps given https://github.com/Abhishekojha38/yocto-playground.git.
+We will start this journey by analysing the zImage and understanding that how zImage is created.
 
-== Analyse the zImage
+== 🔍 Analyse the zImage
 
-* Setup the environment.
+[TIP]
+====
+We already built the QEMU image and yocot SDK in advance. Now, Setup the environment.
+====
 
-```bash
+. We already built the QEMU image and yocot SDK in advance. Now, Setup the environment.
++
+[source,bash]
+----
 source /opt/playground-arm/1.0/environment-setup-cortexa15t2hf-neon-poky-linux-gnueabi
 cd yocto-playground/build-playground-arm/tmp/work/playground_arm-poky-linux-gnueabi/linux-playground/6.12.56
-```
-* This is how vmlinux converted to zImage
+----
 
-```bash
+. when we run the make ARCH=arm zImage command, it will generate the zImage file from the vmlinux file by following certain steps which are explained in the next section.
++
+[source,bash]
+----
 make ARCH=arm zImage
-```
-image::../images/zImage.png[]
+----
+
+image::zImage.png[]
 
 [cols="1,3,2", options="header"]
 |===
@@ -64,50 +82,57 @@ Its meaning differs from the original vmlinux, as it is intended for the compres
 
 |===
 
-image::../images/kernel-bootstrap.png[]
+image::kernel-bootstrap.png[]
 
-=== Step 1: Image
+=== ⚙️ Step 1: Image
 
 `objcopy` is used to generate a binary file:
 
 * `-R`: Removes the section named `.comment` from the ELF file (`vmlinux`).
 * `-S`: Strips debug symbols.
 
-```bash
+[source,bash]
+----
 # Generate Image
 arm-poky-linux-gnueabi-objcopy -O binary -R .comment -S  vmlinux Image
-```
+----
 
-=== Step 2: piggy.gzip
+=== 🗜️ Step 2: piggy.gzip
 
 The Image is compressed with gzip into piggy.gzip. Does this mean that if gzip fails, piggy.gzip will be deleted?
 
-```bash
+[source,bash]
+----
 (cat Image | gzip -n -f -9 > arch/arm/boot/compressed/piggy.gzip) || (rm -f arch/arm/boot/compressed/piggy.gzip ;false)
-```
+----
 
-=== Step3: piggy.gzip.o
+=== 🔗 Step 3: piggy.gzip.o
 
-```bash
+[source,bash]
+----
 arm-poky-linux-gnueabi-gcc -Wp,-MD,arch/arm/boot/compressed/.piggy.gzip.o.d \
                 -nostdinc -isystem  -DCC_HAVE_ASM_GOTO  \
                 -DZIMAGE -c -o arch/arm/boot/compressed/piggy.gzip.o \
                 ../git/arch/arm/boot/compressed/piggy.S
-```
+----
 
-image:../images/piggy-linker-script.png[]
+image::piggy-linker-script.png[]
 
 The two labels, input_data and input_data_end, are used as boundaries (only the binary data between these two labels is what gets loaded).
-From this, we can roughly understand that the purpose of piggy.gzip.S is to provide piggy.gzip to the startup code that runs before the kernel image is loaded (the name piggy implies “carrying on the back”)
+From this, we can roughly understand that the purpose of piggy.gzip.S is to provide piggy.gzip to the startup code that runs before the kernel image is loaded (the name piggy implies "carrying on the back")
 
-=== Step4: Bootstrap loader
+=== 🚀 Step 4: Bootstrap loader
 
 If the bootloader is considered the first half, then the bootstrap loader is the second half. Its main responsibilities are:
+
 * Initializing the CPU/SoC and the required memory.
 * Decompressing the kernel image (if it is compressed; some bootstrap loaders also verify correctness using a checksum) and placing it in memory.
 * Loading the decompressed kernel image.
 
+[NOTE]
+====
 The difference between the bootloader and the bootstrap loader is that the former starts running as soon as power is applied and does not depend on the kernel, while the latter exists in the transitional phase between the end of the bootloader and the handoff to the kernel.
+====
 
 We can summarize the bootstrap loader flow as follows:
 
@@ -116,35 +141,51 @@ We can summarize the bootstrap loader flow as follows:
 * Other processor-specific initialization steps are performed.
 * The Image is loaded.
 
-=== Boot message
+=== 📝 Boot message
 
 This snapshot shows the function used for decompressing the kernel image.
 
-image::../images/decompress-kernel-function.png[]
+image::decompress-kernel-function.png[]
 
-== Initialization Flow
+== 🔄 Initialization Flow
+
+image::kernel-initialization-graph.png[]
+
+=== 📋 head.S
+
+We have already captured `head.o` in the previous step. Now we will see the assembly code of `head.S` and analyse it using QEMU and gdb.
+
+The file `arch/arm/boot/compressed/head.S` is the entry point for the compressed kernel (`zImage`). It is responsible for:
+
+* **Initial Setup**: Setting up the processor state and basic environment.
+* **Stack Setup**: Initializing the stack pointer for the decompression routine.
+* **Decompression**: Calling the `decompress_kernel` function in `misc.c`.
+* **Relocation**: Moving the kernel if it was loaded at a conflicting address.
+* **Execution**: Jumping to the start of the decompressed kernel image.
 
 After building the image we will launch qemu with the following command.
 
-image::../images/launch-qemu-with-gdb.png[]
+image::launch-qemu-with-gdb.png[]
 
-Now QEMU is waiting for the GDB connection. We will connect to it using the following command.
+Now QEMU is waiting for the GDB connection. The `-S` option freezes the CPU at startup, and the `-s` option starts the GDB server on port 1234. We will connect to it using the following command.
 
-image::../images/run-gdb.png[]
+image::run-gdb.png[]
 
 Connect the gdb to qemu by executing the following command in gdb 
 
-```bash
+[source,bash]
+----
 target remote :1234
-```
+----
 
-* Here loading address is 0x40000000 and we will try to display the memory at this address.
+* Here Image loading address is 0x40000000 and we will try to display the memory at this address.
 
-```bash
+[source,bash]
+----
 0x40000010: .word  <machine_type or 0>
 0x40000014: .word  <dtb_phys_addr>
 0x40000018: .word  <kernel_entry_point>
-```
+----
 
 [cols="1,3", options="header"]
 |===
@@ -163,61 +204,66 @@ target remote :1234
 | Jump to kernel entry
 |===
 
+image::dump-pc.png[]
 
-image::../images/dump-pc.png[]
-
-```bash
+[source,assembly]
+----
 ldr     pc, [pc, #4]    ; 0x40000018
-```
+----
 
-Current instruction address = 0x40000010
-pc = 0x40000010 + 8
-pc = 0x40000018   ✅
+image::move-pc-to-next-inst-1.png[]
 
-This we can see in below image.
+==== ⏭️ nops instructions
 
-image::../images/move-pc-to-next-inst-1.png[]
+Execution begins in `arch/arm/boot/compressed/head.S` at the `start` symbol. For legacy reasons, the code starts with 7 or 8 `NOP` instructions.
 
-image::../images/move-pc-to-next-inst-2.png[]
+image::move-pc-to-next-inst-2.png[]
 
-`0x40010000` is the `.text` section of the kernel. Now we can see nops instructions which is the start of head.S file. 
+`0x40010000` is the `.text` section.
+
+[TIP]
+====
 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/arm/boot/compressed/head.S#n188
+====
 
-For a compressed kernel, execution begins at the `start` symbol in `arch/arm/boot/compressed/head.S`. This entry point starts with several `NOP` instructions for legacy reasons, skips over magic numbers, and saves the pointer to the ATAGs/DTB. The decompression routine then executes directly from the physical address where the kernel was loaded into memory.
-
-I think we should also look into the vmlinux to understand the process in more detail. Lets see sections and disassembly of vmlinux.
-
-*vmlinux sections*
-
-image::../images/vmlinux-sections.png[
+To understand the process in more detail, let's dive into the `vmlinux` binary and examine its sections and disassembly.
 
 *vmlinux disassembly*
 
-image::../images/vmlinux-disassembly.png[]
+image::vmlinux-disassembly.png[]
 
-To get more details info we will load the vmlinux at the right location which is our .text section.
+To get more details info in gdb we will load the vmlinux at the right location which is our .text section.
 
-image::../images/load-symbols-vmlinux.png[]
+image::load-symbols-vmlinux.png[]
 
-Wow! symbols are loaded successfully.
+image::gdb-vmlinux-symbols.png[]
 
-image::../images/gdb-vmlinux-symbols.png[]
+==== ⏭️ ATAGS and Arch ID
+`head.S` execution sequence jumps over some magic numbers and saves the pointer to the ATAGs.
 
-Execute next instructions till we reach to the instruction which saves the ATAGS and Arch ID
+image::head.s-atags.png[]
 
-image::../images/head.s-atags.png[]
-
-image::../images/save-atags.png[]
+image::save-atags.png[]
 
 Display R1 and r2 register values to see the ATAGS and Arch ID.
 
-image::../images/display-r1-r2.png[]
+`Arch ID = 0xffffffff`
+`ATAGS = 0x48000000`
+
+image::arch-id-atags-pointer.png[]
+
+==== 🛡️ Enter SVC mode and disable IRQ/FIQ
 
 `safe_svcmode_maskall r0`  This macro is intended for forcing the CPU into SVC mode at boot time.
 
-image::../images/display-r0-cpsr.png[]
+image::enter-svc-mode.png[]
 
-```bash
+image::svc-r0-cpsr.png[]
+
+`msr	spsr_cxsf, r9` saves the CPU boot mode in `SPSR`
+
+[source,assembly]
+----
 0x1d3 = 0000 0000 0000 0000 0000 0001 1101 0011
                                    ^^^^^
                                    1 1101 0011
@@ -226,28 +272,34 @@ image::../images/display-r0-cpsr.png[]
 0x1d3 & 0xc0 = 0xc0 -> IRQ and FIQ disabled
 State ARM
 NZCV flags are set to 0
-```
+----
+
+==== 📍 Locate the start of physical memory
 
 After saving the ATAGS and Arch ID, we will execute the decompression routine.So now the kernel decompression code is executing from the physical address of the physical memory where it was loaded.
 
 The decompression code then locates the start of physical memory. On most modern platforms this is done with the Kconfig-selected code AUTO_ZRELADDR, which means a logical AND between the program counter and 0xf8000000. This means that the kernel readily assumes that it has been loaded and executed in the first part of the first block of physical memory.
 
-*Find the start of physical memory*
+image::find-physical-memory.png[]
 
-image::../images/find-physical-memory.png[]
+once instructions are excuted, we know the starting address of the physical memory.
 
-The kernel image is loaded somewhere in physical memory, often by a bootloader (U-Boot, or in some old systems, Angel).
-The kernel doesn’t know the exact load address yet.
-But it needs a base address for:
-Setting up the stack (sp)
-Copying itself to the proper location
-Accessing global data and relocation info
-So early boot uses PC-relative addressing to calculate a safe “kernel base” address.
+[source,instructions]
+----
+mov	r0, pc
+and	r0, r0, #0xf8000000
+----
 
-When the ARM kernel is first entered, it doesn’t yet know:
+image::find-phy-addr.png[]
 
-* Where physical memory starts
-* Where it has actually been loaded in RAM
+`0x40000000` is the starting address of the physical memory.
+
+The kernel image is loaded somewhere in physical memory, often by a bootloader (U-Boot, or in some old systems, Angel).The kernel doesn't know the exact load address yet. But it needs a base address for:
+
+* Setting up the stack (sp)
+* Copying itself to the proper location
+* Accessing global data and relocation info
+So early boot uses PC-relative addressing to calculate a safe "kernel base" address.
 
 The decompression code needs a base address to work from, because it will eventually:
 
@@ -255,14 +307,17 @@ The decompression code needs a base address to work from, because it will eventu
 * Set up the stack
 * Jump into C code
 
-```bash
+[source,calculation]
+----
 0xf8000000 = 1111 1000 0000 0000 0000 0000 0000 0000
 Top 5 bits = physical memory block
 Lower 27 bits = offset within the block
-```
+----
+
 *So pc & 0xf8000000 keeps the first 32MB-aligned block of memory*
 
 *Example*
+
 Suppose kernel is loaded at:
 PC = 0x400100a4
 Compute:
@@ -270,56 +325,315 @@ Compute:
 0x40000000 → kernel base address
 All PC-relative offsets can now be computed from here safely.
 
-*Why not smaller or bigger mask?*
-Mask smaller (e.g., 0xff000000): too coarse → may include multiple 16MB blocks, kernel could be misaligned
-Mask bigger (e.g., 0xffff0000): too fine → might assume kernel is already at exact address → less flexible
-0xf8000000 is a sweet spot:
-First 32MB block
-Covers kernel + decompression buffer + early data structures
-Works on most platforms supported by early ARM Linux
+==== 📊 Calculate stack top address
 
+. Below instructions are from head.S file which takes care of stack top address calculation.
++
+[source,instruction]
+----
+adr r1, LC1
+ldr sp, [r1]    @ get stack location
+add sp, sp, r1  @ apply relocation
+----
 
-We have the kernel base address now. Next step is to add the TEXT_OFFSET to it to get the kernel base address.
-Then the TEXT_OFFSET is added to the pointer to the start of physical memory. As the name says, this is where the kernel .text segment (as output from the compiler) should be located. The .text segment contains the executable code so this is the actual starting address of the kernel after decompression. The TEXT_OFFSET is usually 0x8000 so the kernel will be located 0x8000 bytes into the physical memory. This is defined in arch/arm/Makefile.
+. To understand the LC1 label we will use objdump.
++
+[source,instruction]
+----
+arm-poky-linux-gnueabi-objdump -D arch/arm/boot/compressed/vmlinux |less
 
-image::../images/textofs.png[]
+ADDRESS <symbol_name>:
+   OFFSET:   MACHINE_CODE    DISASSEMBLED_INSTRUCTION
+----
 
-This snapshot is from arch/arm/Makefile. TEXT_OFFSET is 0x8000 by default
+image::LC0-LC1.png[]
 
-The 0x8000 (32KB) offset is a convention, because usually there is some immobile architecture-specific data placed at 0x00000000 such as interrupt vectors, and many elder systems place the ATAGs at 0x00000100. There also must be some space, because when the kernel finally boots, it will subtract 0x4000 (or 0x5000 for LPAE) from this address and store the initial kernel page table there.
+This instruction from head.S will be converted to
 
-image::../images/stack-location.png[]
+image::of-use.png[]
 
-image::../images/stack-location-gdb.png[]
+Now here current instruction address is `0x400100a8` and Value of pc during execution is `0x400100a8 + 8 = 0x400100b0`. Add `   0x200` to it to get the final value **0x400102b0**.
 
-```bash
+image::stack-location.png[]
+
+image::stack-location-gdb.png[]
+
+[source,instruction]
+----
 add r1, pc, #512    @ r1 = PC + 0x200
+----
+
+Here is the values of r1 and PC register before execution of first instruction. We can see that r1 address is `0x400102b0` which is matching with the value in the objdump output LC1: 0x000002b0
+
+image::of-use-1.png[]
+
+[source,instruction]
+----
 ldr sp, [r1]         @ sp = [r1]
-add sp, sp, r1       @ sp = sp + r1
-```
-image::../images/sp-before-relocation.png[]
+----
+
+Here is the value of sp register after execution of above instruction.
+
+image::sp-before-relocation.png[]
 
 At this point in GDB, we have just done the ldr sp, [r1], but not yet the relocation (add sp, sp, r1)
-That’s why SP = 0x009fb680 → it is the offset read from memory, not the final absolute address.
+That's why SP = 0x9faa10 → it is the offset read from memory, not the final absolute address.
 
-image::../images/sp-after-relocation.png[]
+image::sp-after-relocation.png[]
 
 Now we have the final absolute address of the stack.
 
 ```bash
-sp_final = 0x00a0b680 + 0x400102b0
-         = 0x40a0b930
+sp_final = 0x009faa10 + 0x400102b0
+         = 0x40a0acc0
 ```
+
+Stack caluculation was bit tricky to undestand and that's why I am adding more details to it.
+
+**LC1 and .L_user_stack_end Offset Analysis (ARM zImage Decompressor)**
+
+`.L_user_stack_end` is *not* a linker symbol.
+
+It is a **local assembler label** defined in `head.S`.
+
+Instead, its value is derived from the end of the `.stack` section.
+
+The LC1 object stores *relative offsets*:
+
+----
+LC1[0] = .L_user_stack_end - LC1
+LC1[1] = _edata - LC1
+----
+
+At runtime:
+
+----
+real_address = LC1_address + stored_offset
+----
+
+This allows the decompressor to remain fully position-independent.
+
+---
+
+*Section Layout (readelf)*
+
+Command:
+
+----
+arm-poky-linux-gnueabi-readelf -S arch/arm/boot/compressed/vmlinux
+----
+
+Output:
+
+----
+There are 24 section headers, starting at offset 0xa17c04:
+
+Section Headers:
+  [Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            00000000 000000 000000 00      0   0  0
+  [ 1] .text             PROGBITS        00000000 001000 006368 00  AX  0   0 32
+  [ 2] .table            PROGBITS        00006368 007368 00001c 00  WA  0   0  4
+  [ 3] .rodata           PROGBITS        00006384 007384 000da8 00   A  0   0  4
+  [ 4] .piggydata        PROGBITS        0000712c 00812c 9f2b47 00   A  0   0  1
+  [ 5] .got.plt          PROGBITS        009f9c74 9fac74 00000c 04  WA  0   0  4
+  [ 6] .got              PROGBITS        009f9c80 9fac80 000024 00  WA  0   0  4
+  [ 7] .pad              PROGBITS        009f9ca4 9faca4 000004 00   A  0   0  1
+  [ 8] .bss              NOBITS          009f9ca8 9faca8 000018 00  WA  0   0  4
+  [ 9] .stack            NOBITS          009f9cc0 9faca8 001000 00  WA  0   0  1
+----
+
+Important values:
+
+----
+.stack Addr = 0x009f9cc0
+.stack Size = 0x1000
+----
+
+Therefore:
+
+----
+.L_user_stack_end = 0x009f9cc0 + 0x1000
+                 = 0x009facc0
+----
+
+*Symbol Lookup (nm)*
+
+Commands:
+
+----
+arm-poky-linux-gnueabi-nm -n arch/arm/boot/compressed/vmlinux |grep LC1
+----
+
+Output:
+
+----
+000002b0 t LC1
+----
+
+Additional symbols:
+
+----
+arm-poky-linux-gnueabi-nm -n arch/arm/boot/compressed/vmlinux |egrep "LC1|_edata|_start"
+----
+
+Output:
+
+----
+00000000 T _magic_start
+00000000 T _start
+000002b0 t LC1
+00005cec T fdt_check_mem_start
+00006368 D _table_start
+009f9c80 D _got_start
+009f9ca8 B __bss_start
+009f9ca8 R _edata
+009f9ca8 R _edata_rea
+----
+
+So:
+
+----
+LC1     = 0x000002b0
+_edata  = 0x009f9ca8
+----
+
+Compute:
+
+----
+_edata - LC1 = 0x009f9ca8 - 0x2b0 = 0x009f99f8
+----
+
+*Raw LC1 Contents (objdump)*
+
+Command:
+
+----
+arm-poky-linux-gnueabi-objdump -s -j .text arch/arm/boot/compressed/vmlinux |grep "02b0 "
+----
+
+Output:
+
+----
+ 02b0 10aa9f00 f8999f00 e4dbaf00 b3999f00  ................
+----
+
+Little endian decoding:
+
+----
+Word0 = 0x009faa10
+Word1 = 0x009f99f8
+----
+
+*LC1 Disassembly Context*
+
+Command:
+
+----
+arm-poky-linux-gnueabi-objdump -D arch/arm/boot/compressed/vmlinux |grep -A6 LC1
+----
+
+Output:
+
+----
+      c8:       359f01e8        ldrcc   r0, [pc, #488]  @ 2b8 <LC1+0x8>
+      cc:       3080000f        addcc   r0, r0, pc
+      d0:       31540000        cmpcc   r4, r0
+      d4:       33844001        orrcc   r4, r4, #1
+      d8:       2b000078        blcs    2c0 <cache_on>
+
+000000dc <restart>:
+--
+000002b0 <LC1>:
+     2b0:       009faa10
+     2b4:       009f99f8
+     2b8:       00afdbe4
+     2bc:       009f99b3
+
+000002c0 <cache_on>:
+----
+
+*Stack Offset Calculation*
+
+From earlier:
+
+----
+.L_user_stack_end = 0x009facc0
+LC1               = 0x000002b0
+----
+
+Compute:
+
+----
+.L_user_stack_end - LC1
+= 0x009facc0 - 0x2b0
+= 0x009faa10
+----
+
+This matches LC1[0]:
+
+----
+009faa10
+----
+
+*Final Interpretation of LC1*
+
+LC1 contains:
+
+----
+LC1[0] = 0x009faa10  -> (.L_user_stack_end - LC1)
+LC1[1] = 0x009f99f8  -> (_edata - LC1)
+----
+
+At runtime:
+
+----
+sp = LC1 + LC1[0]
+r6 = LC1 + LC1[1]
+----
+
+Which reconstructs:
+
+* stack top
+* end of image
+
+without absolute addresses.
+
+Final values for this build:
+
+----
+.stack Addr = 0x009f9cc0
+.stack Size = 0x1000
+
+.L_user_stack_end = 0x009facc0
+LC1 = 0x2b0
+
+Stack Offset = 0x009faa10
+_edata Offset = 0x009f99f8
+----
+
+Everything matches exactly.
 
 Next we check if we would overwrite the compressed kernel with the uncompressed kernel. That would be unfortunate. If this would happen, we check where in the memory the uncompressed kernel would end, and then we copy ourselves (the compressed kernel) past that location.
 
 Then the code simply does a trick to jump back to the relocated address of a label called restart: which is the start of the code to set up the stack pointer and malloc() area, but now executing at the new physical address.
 
+We have the kernel base address now. Next step is to add the TEXT_OFFSET to it to get the kernel base address.
+Then the TEXT_OFFSET is added to the pointer to the start of physical memory. As the name says, this is where the kernel .text segment (as output from the compiler) should be located. The .text segment contains the executable code so this is the actual starting address of the kernel after decompression. The TEXT_OFFSET is usually 0x8000 so the kernel will be located 0x8000 bytes into the physical memory. This is defined in arch/arm/Makefile.
+
+image::textofs.png[]
+
+This snapshot is from arch/arm/Makefile. TEXT_OFFSET is 0x8000 by default
+
+[NOTE]
+====
+The 0x8000 (32KB) offset is a convention, because usually there is some immobile architecture-specific data placed at 0x00000000 such as interrupt vectors, and many elder systems place the ATAGs at 0x00000100. There also must be some space, because when the kernel finally boots, it will subtract 0x4000 (or 0x5000 for LPAE) from this address and store the initial kernel page table there.
+====
+
 This means it will again set up the stack and malloc() area and look for the appended DTB and everything will look like the kernel was loaded in this location to begin with. (With one difference though: we have already augmented the DTB with ATAGs, so that will not be done again.) This time the uncompressed kernel will not overwrite the compressed kernel.
 
-image::../images/restart-function.png[]
+image::restart-function.png[]
 
-image::../images/setup-sp.png[]
+image::setup-sp.png[]
 
 ```bash
 
@@ -327,4 +641,4 @@ image::../images/setup-sp.png[]
           add r10, sp, #MALLOC_SIZE  
 ```
 
-image::../images/malloc-space.png[]
+image::malloc-space.png[]
