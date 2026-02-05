@@ -613,6 +613,21 @@ _edata Offset = 0x009f99f8
 
 Everything matches exactly.
 
+==== ⏭️ fdt_check_mem_start
+
+Traditionally, the start address of physical memory is obtained by masking the program counter.  However, this does require that this address is a multiple of 128 MiB, precluding booting Linux on platforms where this requirement is not fulfilled. Hence validate the calculated address against the memory information in the DTB, and, if out-of-range, replace it by the real start address. To preserve backwards compatibility (systems reserving a block of memory at the start of physical memory, kdump, ...), the traditional method is always used if it yields a valid address.
+
+0x48000000 is the fdt location passed as ATAGs. If we dump this location, we get:
+
+image::../images/fdt-mem-check.png[]
+
+first word is 0xedfe0dd0 which is byte-swapped magic number for fdt in fdt header.
+----
+0xedfe0dd0  -> 0xd00dfeed  ✅
+----
+
+image::../images/memory-address.png[]
+
 Next we check if we would overwrite the compressed kernel with the uncompressed kernel. That would be unfortunate. If this would happen, we check where in the memory the uncompressed kernel would end, and then we copy ourselves (the compressed kernel) past that location.
 
 Then the code simply does a trick to jump back to the relocated address of a label called restart: which is the start of the code to set up the stack pointer and malloc() area, but now executing at the new physical address.
