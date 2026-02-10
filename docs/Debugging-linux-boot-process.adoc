@@ -628,32 +628,120 @@ first word is 0xedfe0dd0 which is byte-swapped magic number for fdt in fdt heade
 
 image::../images/memory-address.png[]
 
-Next we check if we would overwrite the compressed kernel with the uncompressed kernel. That would be unfortunate. If this would happen, we check where in the memory the uncompressed kernel would end, and then we copy ourselves (the compressed kernel) past that location.
+==== Determine final kernel image address
 
-Then the code simply does a trick to jump back to the relocated address of a label called restart: which is the start of the code to set up the stack pointer and malloc() area, but now executing at the new physical address.
+* These are the instructions from head.S which adds the TEXT_OFFSET to the physical address(0x40000000).
 
 We have the kernel base address now. Next step is to add the TEXT_OFFSET to it to get the kernel base address.
-Then the TEXT_OFFSET is added to the pointer to the start of physical memory. As the name says, this is where the kernel .text segment (as output from the compiler) should be located. The .text segment contains the executable code so this is the actual starting address of the kernel after decompression. The TEXT_OFFSET is usually 0x8000 so the kernel will be located 0x8000 bytes into the physical memory. This is defined in arch/arm/Makefile.
+Then the TEXT_OFFSET is added to the pointer to the start of physical memory. As the name says, this is where the kernel .text segment (as output from the compiler) should be located. The .text segment contains the executable code so this is the actual starting address of the kernel after decompression. This is defined in arch/arm/Makefile.
+
+-----
+		/* Determine final kernel image address. */
+	add	r4, r0, #TEXT_OFFSET
+#else
+		ldr	r4, =zreladdr
+#endif
+-----
 
 image::textofs.png[]
 
-This snapshot is from arch/arm/Makefile. TEXT_OFFSET is 0x8000 by default
+image::../images/text-offset.png[]
 
-[NOTE]
-====
-The 0x8000 (32KB) offset is a convention, because usually there is some immobile architecture-specific data placed at 0x00000000 such as interrupt vectors, and many elder systems place the ATAGs at 0x00000100. There also must be some space, because when the kernel finally boots, it will subtract 0x4000 (or 0x5000 for LPAE) from this address and store the initial kernel page table there.
-====
+For some specific platforms the TEXT_OFFSET will be pushed downwards in memory, notably some Qualcomm platforms will push it to `0x00208000` because the first `0x00200000` (2 MB) of the physical memory is used for shared memory communication with the modem CPU.
 
-This means it will again set up the stack and malloc() area and look for the appended DTB and everything will look like the kernel was loaded in this location to begin with. (With one difference though: we have already augmented the DTB with ATAGs, so that will not be done again.) This time the uncompressed kernel will not overwrite the compressed kernel.
+----
+(gdb) info registers r4 r0
+r4             0x40208000          1075871744
+r0             0x40000000          1073741824
+(gdb) 
+----
 
-image::restart-function.png[]
+`r4` = `r0` + `TEXT_OFFSET` = `0x40000000` + `0x208000` = `0x40208000`
 
-image::setup-sp.png[]
+so the kernel will be located at `0x40208000`
 
-```bash
+==== Setup page tables for cache only
 
-          /* malloc space is above the relocated stack (64k max) */                                                                                                                                         
-          add r10, sp, #MALLOC_SIZE  
-```
+Next the decompression code sets up a page table, if it is possible to fit one over the whole uncompressed+compressed kernel image. The page table is not for virtual memory, but for enabling cache, which is then turned on. The decompression will for natural reasons be much faster if we can use cache.
 
-image::malloc-space.png[]
+Set up a page table only if it won't overwrite ourself.That means `r4` < `pc` || `r4` - 16k page directory > `&_end`.Given that `r4` > `&_end` is most unfrequent, we add a rough additional 1MB of room for a possible appended DTB.
+
+* Here r0 is the PC and r4 is the address with TEXT_OFFSET.
+
+----
+(gdb) info registers r0 r4
+r0             0x400100c8          1073807560
+r4             0x40208000          1075871744
+(gdb)
+----
+
+==== sets up a local stack pointer
+
+The kernel sets up a local stack pointer and malloc() area so we can handle subroutine calls and small memory allocation going forward, executing code written in C. This is set to point right after the end of the kernel image.
+
+----
+(gdb) info registers pc r0
+pc             0x400100e0          0x400100e0 <restart+4>
+r0             0x400102b0          1073808048
+(gdb) 
+----
+
+Address of LC1 is `0x400102b0` and PC is `0x400100e0`. `0x400102b0` looks familiar, it is the same address as the stack pointer in the previous section where LC1 was calculated.
+
+image::../images/stack-ptr-lc1.png[]
+
+Now `sp` is pointing to the TOP of the stack
+
+==== malloc() area
+
+* malloc space is above the relocated stack (64k max)
+
+----
+/* malloc space is above the relocated stack (64k max) */
+=> 0x40010118 <restart+60>:     add     r10, sp, #65536 @ 0x10000
+---- 
+
+----
+(gdb) info registers r10 sp
+r10            0x40a1acc0          1084337344
+sp             0x40a0acc0          0x40a0acc0
+(gdb) 
+----
+
+`sp` + `0x10000` = `0x40a1acc0`
+
+==== check for an appended DTB blob
+
+This is not enabled in our case. CONFIG_ARM_APPENDED_DTB should be enabled to use this feature.
+
+==== Check to see if we will overwrite ourselves
+
+We basically want:
+
+*   r4 - 16k page directory >= r10 -> OK
+*   r4 + image length <= address of wont_overwrite -> OK
+* Note: the possible LSB in r4 is harmless here.
+
+----
+0x40010120 <restart+68>:     add     r10, r10, #16384        @ 0x4000
+0x40010124 <restart+72>:     cmp     r4, r10
+0x40010128 <restart+76>:     bcs     0x400101b4 <wont_overwrite>
+0x4001012c <restart+80>:     add     r10, r4, r9
+0x40010130 <restart+84>:     add     r9, pc, #124    @ 0x7c
+0x40010134 <restart+88>:     cmp     r10, r9
+0x40010138 <restart+92>:     bls     0x400101b4 <wont_overwrite>
+----
+
+*   `r4` = final kernel address (possibly with LSB set)
+*   `r9` = size of decompressed image
+*   `r10` = end of this image, including  bss/stack/malloc space if non XIP
+
+----
+(gdb) info registers r9 r4 r10
+r9             0x1971d2c           26680620
+r4             0x40208001          1075871745
+r10            0x40a1acc0          1084337344
+(gdb) 
+----
+
+*TBD*
