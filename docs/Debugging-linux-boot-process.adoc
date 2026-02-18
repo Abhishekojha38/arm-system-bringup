@@ -722,26 +722,307 @@ We basically want:
 *   r4 + image length <= address of wont_overwrite -> OK
 * Note: the possible LSB in r4 is harmless here.
 
-----
-0x40010120 <restart+68>:     add     r10, r10, #16384        @ 0x4000
-0x40010124 <restart+72>:     cmp     r4, r10
-0x40010128 <restart+76>:     bcs     0x400101b4 <wont_overwrite>
-0x4001012c <restart+80>:     add     r10, r4, r9
-0x40010130 <restart+84>:     add     r9, pc, #124    @ 0x7c
-0x40010134 <restart+88>:     cmp     r10, r9
-0x40010138 <restart+92>:     bls     0x400101b4 <wont_overwrite>
-----
-
 *   `r4` = final kernel address (possibly with LSB set)
 *   `r9` = size of decompressed image
 *   `r10` = end of this image, including  bss/stack/malloc space if non XIP
 
+
+===== Physical Memory Map
+
+image::../images/memory-map.png[]
+
+[listing]
 ----
-(gdb) info registers r9 r4 r10
-r9             0x1971d2c           26680620
-r4             0x40208001          1075871745
-r10            0x40a1acc0          1084337344
-(gdb) 
+Physical Address    Size / Offset       Region
+────────────────────────────────────────────────────────────────────────────────
+0x40000000                              ◄─── Start of Physical RAM
+                                             │
+                                             │  ~64 KiB gap
+                                             │
+0x40010000                              ◄─── Decompressor load address (head.S)
+                                             │  zImage executing here
+                                             │
+0x400101b4                              ◄─── r9 (2nd snapshot) = adr wont_overwrite
+                                             │  Runtime PC-relative addr of the
+                                             │  wont_overwrite label
+                                             │  (only +0x1b4 bytes into decompressor!)
+                                             │
+                    [ compressed image  ]
+                    [ BSS               ]
+                    [ stack             ]    <── grows downward
+                    [ malloc area       ]
+                    [ page directory    ]    
+                         │
+0x40a0acc0                              ◄─── Stack top
+                                             LC1 + LC1[0]
+                                             LC1[0] = 0x009faa10
+                         │
+0x40a1acc0                              ◄─── Malloc region top
+                                             (+0x10000 = 64 KiB above stack top)
+                         │
+0x40a1ecc0                              ◄─── r10 (1st snapshot)
+                                             End of decompressor working area
+                                             = malloc top + 16 KiB page dir
+                                             THIS is the boundary tested in Check A
+
+════════════════════════════════════════════════════════════════════════════════
+                    !! OVERLAP ZONE  —  Both checks FAIL  →  RELOCATE !!
+════════════════════════════════════════════════════════════════════════════════
+                         │
+0x40208000/1                            ◄─── r4 (both snapshots) = 0x40208001
+                                             Final kernel load address (ZRELADDR)
+                                             LSB=1 is harmless Thumb interwork bit
+                                             Effective address = 0x40208000
+                    [                   ]
+                    [                   ]
+                    [  DECOMPRESSED      ]
+                    [  KERNEL IMAGE      ]    size = 0x1971d2c (26,680,620 bytes)
+                    [                   ]
+                    [  !! ENGULFS the   ]
+                    [  decompressor !!  ]    0x40208000 → ~0x40a1ecc0 overlaps
+                    [                   ]    the entire decompressor working area
+                    [                   ]
+0x41b79d2d                              ◄─── r10 (2nd snapshot) = r4 + image_size
+                                             = 0x40208001 + 0x1971d2c
+                                             End of decompressed kernel
+                                             Compared against wont_overwrite (r9)
+                                             0x41b79d2d > 0x400101b4  FAIL
+                         │
+════════════════════════════════════════════════════════════════════════════════
+                    Decompressor copies itself HERE (above kernel destination)
+════════════════════════════════════════════════════════════════════════════════
+                         │
+                    [ reloc destination ]    ◄─── 256-byte aligned above 0x41b79d2d
+                                                  = (0x41b79d2d + reloc_code_size
+                                                     + 256) & ~255
+                         │
+0x48000000                              ◄─── FDT (Flattened Device Tree)
+                                             Passed by bootloader (e.g. U-Boot)
+────────────────────────────────────────────────────────────────────────────────
 ----
+
+===== Arithmetic Proof of Overlap
+
+====== Check A — Is the final load address above the decompressor?
+
+[listing]
+----
+Condition to PASS (no overlap):   r4  >=  (r10 + 16384)
+
+Substituting:   0x40208001  >=  (0x40a1acc0 + 0x4000)
+                0x40208001  >=   0x40a1ecc0
+
+                0x40208001  is  1,075,871,745
+                0x40a1ecc0  is  1,084,353,728
+
+Result:  FALSE ✗  →  bhs NOT taken  →  fall through to Check B
+
+Meaning: The final kernel load address (0x40208000) sits 34 MiB BELOW
+         the top of the decompressor's working area (0x40a1ecc0).
+         Decompression would write into the decompressor's own stack
+         and malloc region.
+----
+
+====== Check B — Does the kernel fit entirely below the decompressor code?
+
+[listing]
+----
+Condition to PASS (no overlap):   (r4 + image_size)  <=  addr(wont_overwrite)
+                                   r10               <=  r9   (post-reassignment)
+
+Substituting:   0x41b79d2d  <=  0x400101b4
+
+                0x41b79d2d  is  1,102,552,365
+                0x400101b4  is  1,073,807,796
+
+Result:  FALSE ✗  →  bls NOT taken  →  fall through to relocation
+
+Meaning: The decompressed kernel ends at 0x41b79d2d, which is 474 MiB
+         ABOVE the wont_overwrite label (0x400101b4).
+         The kernel destination range completely engulfs the running
+         decompressor code.
+----
+
+image::../images/decompress-kernel.png[]
+
+NOTE: Between the two snapshots the code executed `add r10, r4, r9` (r10 becomes
+end-of-kernel) and `adr r9, wont_overwrite` (r9 becomes the safe-exit label address).
+The registers change role — do not confuse the two snapshots.
+
+===== Overlap Extent Summary
+
+[listing]
+----
+Decompressed kernel occupies:   0x40208000  →  0x41b79d2c   (26,680,620 bytes / ~25.4 MiB)
+Decompressor code + data at:    0x40010000  →  0x40a1ecc0   ( 9,957,568 bytes / ~9.5 MiB)
+
+Overlap region:                 0x40208000  →  0x40a1ecc0   ( 8,290,496 bytes / ~7.9 MiB)
+
+Verdict: The decompressor is ENTIRELY INSIDE the kernel's destination range.
+         Decompression without relocation would corrupt its own executing code,
+         stack, malloc heap, and page-directory scratch space.
+----
+
+==== Relocation Code Walkthrough
+
+Both checks failed, so the decompressor must move itself above the kernel destination before inflating the image.
+
+[source,armasm]
+----
+/*
+ * r6  = _edata  (end of compressed data / start of BSS)
+ * r10 = 0x41b79d2d  (end of decompressed kernel, computed in Check B)
+ */
+
+; Round the relocation destination up to the next 256-byte boundary,
+; adding room for the relocation trampoline itself so it cannot
+; overwrite itself during the copy.
+add  r10, r10, #((reloc_code_end - restart + 256) & ~255)
+bic  r10, r10, #255
+; r10 = 256-byte-aligned base just above 0x41b79d2d
+; This is where the decompressor will copy itself TO.
+
+; Find the start of code to copy (restart label), aligned down to 32 bytes.
+adr  r5, restart
+bic  r5, r5, #31
+; r5 ≈ 0x40010000 — source start of decompressor code
+----
+
+===== Why copy backwards (high address → low address)?
+
+[listing]
+----
+Source range:       r5 (≈0x40010000)  →  r6 (_edata, ≈0x40a1xxxx)
+Destination range:  r10 (>0x41b79d2d) →  r10 + (r6 - r5)
+
+Since destination base > source base, a FORWARD copy (low→high) would
+overwrite later source bytes before they are read.
+
+Example with forward copy:
+  Copy word at src[0] → dst[0]  OK
+  Copy word at src[1] → dst[1]  OK  (but dst[0] might alias src[N])
+  ...eventually dst pointer catches up and clobbers unread src data.
+
+A BACKWARD copy (starting from _edata, working toward restart) reads
+each word before the write pointer reaches its source location,
+guaranteeing a clean copy even when regions overlap.
+----
+
+===== Execution flow after relocation
+
+[listing]
+----
+1.  Decompressor copies restart..._edata  to  r10 (above 0x41b79d2d), backwards.
+2.  Branch to the relocated copy of restart.
+3.  Re-initialise registers for decompression in the new location.
+4.  Inflate compressed kernel → 0x40208000 through 0x41b79d2c.
+    (Safe: decompressor code is now above 0x41b79d2d.)
+5.  Jump to uncompressed kernel entry at 0x40208000.
+6.  Kernel reads FDT from 0x48000000 (passed in r2 by bootloader).
+----
+
+===== Overwrite Check Decision Tree
+
+[listing]
+----
+              ┌──────────────────────────────────────────┐
+              │          START  (head.S entry)            │
+              └─────────────────┬────────────────────────┘
+                                │
+              ┌─────────────────▼────────────────────────┐
+              │  Check A:  r4 >= (r10 + 16K) ?           │
+              │  0x40208001 >= (0x40a1ecc0 + 0x4000)     │
+              │  0x40208001 >= 0x40a22cc0   →  FALSE ✗   │
+              └─────────────────┬────────────────────────┘
+                   FAIL ✗       │         PASS ✓
+                                │    ┌────┘
+                                │    └───────────────────► wont_overwrite
+                                │                          (decompress in place)
+              ┌─────────────────▼────────────────────────┐
+              │  Check B:  (r4 + size) <= wont_overwrite? │
+              │  r10 <= r9                                 │
+              │  0x41b79d2d <= 0x400101b4  →  FALSE ✗    │
+              └─────────────────┬────────────────────────┘
+                   FAIL ✗       │         PASS ✓
+                                │    ┌────┘
+                                │    └───────────────────► wont_overwrite
+                                │                          (decompress in place)
+              ┌─────────────────▼────────────────────────┐
+              │  RELOCATE SELF above 0x41b79d2d           │
+              │  ● r10 = 256-byte aligned dest            │
+              │  ● copy restart.._edata backwards         │
+              │  ● jump to relocated code                  │
+              │  ● decompress kernel → 0x40208000         │
+              │  ● branch to kernel entry                  │
+              └──────────────────────────────────────────┘
+----
+
+===== Complete Address Reference Table
+
+[cols="2,1,1,3", options="header"]
+|===
+| Symbol / Region | Address | Source | Notes
+
+| Physical RAM base
+| `0x40000000`
+| known
+| SoC memory start
+
+| Decompressor base
+| `0x40010000`
+| known
+| Loaded by bootloader; executing here
+
+| `wont_overwrite` label
+| `0x400101b4`
+| GDB snap 2 r9
+| Only +0x1b4 bytes past decompressor base
+
+| r4 — final kernel address
+| `0x40208001`
+| GDB both snaps
+| LSB=1 Thumb bit; effective addr = `0x40208000`
+
+| Stack top
+| `0x40a0acc0`
+| calculated
+| `LC1 + LC1[0]`; `LC1[0]` = `0x009faa10`
+
+| Malloc region top
+| `0x40a1acc0`
+| calculated
+| Stack top + 64 KiB (`0x10000`)
+
+| r10 — decompressor end
+| `0x40a1ecc0`
+| GDB snap 1 r10
+| Malloc top + 16 KiB page directory
+
+| Check A threshold
+| `0x40a22cc0`
+| derived
+| `r10 + 0x4000`; r4 must be ≥ this to be safe
+
+| r9 — image size
+| `0x01971d2c`
+| GDB snap 1 r9
+| 26,680,620 bytes ≈ 25.4 MiB uncompressed
+
+| r10 — end of kernel
+| `0x41b79d2d`
+| GDB snap 2 r10
+| `r4 + image_size` = `0x40208001 + 0x1971d2c`
+
+| Relocation destination
+| `> 0x41b79d2d`
+| derived
+| 256-byte aligned; `(0x41b79d2d + reloc_size + 256) & ~255`
+
+| FDT
+| `0x48000000`
+| known
+| Passed in r2 by bootloader
+|===
+
 
 *TBD*
