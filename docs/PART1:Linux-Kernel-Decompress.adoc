@@ -870,6 +870,67 @@ After the copy the decompressor flushes the D-cache and branches to the relocate
     mov     pc, r0              @ JUMP to relocated restart: at 0x41B7A600+offset
 ----
 
+🔹 **What is proc_info?**
+
+`proc_info` (often called `proc_info_list` in the kernel) is a per-CPU descriptor structure used very early during boot.
+👉 It tells the kernel:
+How to identify a CPU
+Which functions to use for that CPU (cache, MMU, etc.)
+
+[source,c]
+----
+/*
+ * Note!  struct processor is always defined if we're
+ * using MULTI_CPU, otherwise this entry is unused,
+ * but still exists.
+ *
+ * NOTE! The following structure is defined by assembly
+ * language, NOT C code.  For more information, check:
+ *  arch/arm/mm/proc-*.S and arch/arm/kernel/head-armv.S
+ */
+struct proc_info_list {
+	unsigned int	 cpu_val;
+	unsigned int	 cpu_mask;
+	unsigned long	 __cpu_mmu_flags;	/* used by head-armv.S */
+	unsigned long	 __cpu_flush;		/* used by head-armv.S */
+	const char	 *arch_name;
+	const char	 *elf_name;
+	unsigned int	 elf_hwcap;
+	struct proc_info_item *info;
+#ifdef MULTI_CPU
+	struct processor *proc;
+#else
+	void		 *unused;
+#endif
+};
+----
+
+[source,armasm]
+----
+/*
+ * Clean and flush the cache to maintain consistency.
+ *
+ * On entry,
+ *  r0 = start address
+ *  r1 = end address (exclusive)
+ * On exit,
+ *  r1, r2, r3, r9, r10, r11, r12 corrupted
+ * This routine must preserve:
+ *  r4, r6, r7, r8
+ */
+		.align	5
+cache_clean_flush:
+		mov	r3, #16             @ Call the function located at offset 16 inside each proc_types entry
+		mov	r11, r1             @ save end address
+		b	call_cache_fn
+
+call_cache_fn:
+		Detects which CPU you are running on
+		Walks through a table of supported CPUs (proc_types)
+		Finds a matching entry
+		Calls the correct cache operation function for that CPU
+----
+
 [NOTE]
 ====
 The relocated `restart:` re-executes the stack/malloc setup (`sp`, `r6`, `r10`)
@@ -921,6 +982,28 @@ Each entry is patched with the relocation delta:
     blo     1b                  @ loop until all GOT entries patched
 ----
 
+🔹 **What is the Global Offset Table (GOT)?**
+The GOT is a table of pointers used by dynamically-linked executables to resolve the addresses of global variables and functions at runtime.
+👉 In this context, it’s used to fix the addresses of global variables in `misc.c` after the decompressor has been relocated to a new memory location.
+
+[source,c]
+----
+/*
+ * Global Offset Table (GOT) for the decompressor.
+ * This table is used to store the absolute addresses of global variables
+ * in misc.c, which are used by the decompressor.
+ */
+got:
+    .long   _edata              @ end of initialized data
+    .long   _end                @ end of BSS
+    .long   _etext              @ start of code
+    .long   _end                @ end of BSS
+---- 
+
+----
+new_address = old_address(r1) + delta(r0)
+----
+
 === BSS Clear
 
 All uninitialized global variables in `misc.c` live in `.bss`.
@@ -936,6 +1019,16 @@ not_relocated:
     str     r0, [r2], #4
     cmp     r2, r3              @ reached end of BSS?
     blo     1b
+----
+
+[source,armasm]
+----
+r0  = relocation delta
+r11 = GOT start
+r12 = GOT end
+r2  = BSS start
+r3  = BSS end
+r5  = appended DTB size (extra bump)
 ----
 
 === Calling decompress_kernel()
