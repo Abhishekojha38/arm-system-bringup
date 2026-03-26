@@ -539,6 +539,8 @@ convention exists because:
 
 === Setting Up the Page Table and Enabling Caches
 
+Set up a page table only if it won't overwrite ourself. That means r4 < pc || r4 - 16k page directory > &_end. Given that r4 > &_end is most unfrequent, we add a rough additional 1MB of room for a possible appended DTB.
+
 Decompressing ~10 MB in software is slow.  Enabling the CPU's I-cache and D-cache
 dramatically speeds it up.  ARM caches require a page table even for a flat 1:1
 virtual=physical mapping:
@@ -559,9 +561,38 @@ virtual=physical mapping:
     blcs    cache_on            @ call cache_on if safe
 ----
 
+[source,gdb]
+----
+=> 0x400100c0 <not_angel+96>:   mov     r0, pc
+   0x400100c4 <not_angel+100>:  cmp     r0, r4
+   0x400100c8 <not_angel+104>:  ldrcc   r0, [pc, rgba(35, 148, 148, 1)]  @ 0x400102b8
+   0x400100cc <not_angel+108>:  addcc   r0, r0, pc
+   0x400100d0 <not_angel+112>:  cmpcc   r4, r0
+   0x400100d4 <not_angel+116>:  orrcc   r4, r4, #1
+   0x400100d8 <not_angel+120>:  blcs    0x400102c0 <cache_on>
+   0x400100dc <restart>:        add     r0, pc, #460    @ 0x1cc
+   0x400100e0 <restart+4>:      ldr     sp, [r0]
+   0x400100e4 <restart+8>:      ldr     r6, [r0, #4]
+(gdb) 
+r0             0x40b4ae00          1085582848
+r4             0x40208001          1075871745
+pc             0x400100d8          0x400100d8 <not_angel+120>
+---- 
+
+[source,analysis]
+----
+r4 < pc ? 0x40208001 < 0x400100d8 ? No
+(r4 - 16KB) > &_end ? 0x40208001 - 0x4000 > 0x40b4ae00 ? No
+----
+
+** SKIP cache_on **
+
+[NOTE]
+====
 `cache_on` selects the correct cache-enable routine from the `proc_types` table
 by matching the CPU ID register (`CP15 c0`).  This handles all ARM variants from
 ARMv4 through ARMv7.
+====
 
 === Setting Up Stack and Malloc Area (restart: label)
 
@@ -646,6 +677,29 @@ arm-poky-linux-gnueabi-readelf -S arch/arm/boot/compressed/vmlinux
 
 .Complete stack, BSS and malloc layout after restart: completes
 image::../../images/diag-stack-malloc.png[Stack malloc diagram, 620, align=center]
+
+==== get_inflated_image_size
+
+[source,armasm]
+----
+restart:	adr	r0, LC1
+		ldr	sp, [r0]
+		ldr	r6, [r0, #4]
+		add	sp, sp, r0
+		add	r6, r6, r0
+
+		get_inflated_image_size	r9, r10, lr
+----
+
+[source,gdb]
+----
+(gdb) info registers r9 r10 lr
+r9             0x1a73524           27735332
+r10            0x1                 1
+lr             0xa7                167
+(gdb) 
+----
+r9 is the size of decompressed image.
 
 ==== Malloc Area
 
@@ -870,6 +924,162 @@ After the copy the decompressor flushes the D-cache and branches to the relocate
     mov     pc, r0              @ JUMP to relocated restart: at 0x41B7A600+offset
 ----
 
+Do you know: `cache functions` selects the correct cache-enable routine from the `proc_types` table
+by matching the CPU ID register .  This handles all ARM variants from ARMv4 through ARMv7. we are going to understand this flow now.
+Reference: https://elixir.bootlin.com/linux/v6.10/source/arch/arm/boot/compressed/head.S#L1259
+
+
+Trace the `cache_clean_flush` function.
+
+[source,armasm]
+----
+/*
+ * Clean and flush the cache to maintain consistency.
+ *
+ * On entry,
+ *  r0 = start address
+ *  r1 = end address (exclusive)
+ * On exit,
+ *  r1, r2, r3, r9, r10, r11, r12 corrupted
+ * This routine must preserve:
+ *  r4, r6, r7, r8
+ */
+		.align	5
+cache_clean_flush:
+		mov	r3, #16             @ Call the function located at offset 16 inside each proc_types entry
+		mov	r11, r1             @ save end address
+		b	call_cache_fn
+
+call_cache_fn:
+		Detects which CPU you are running on
+		Walks through a table of supported CPUs (proc_types)
+		Finds a matching entry
+		Calls the correct cache operation function for that CPU
+----
+
+Here is the loop to find the correct cache operation function for the CPU:
+
+[source,armasm]
+----
+call_cache_fn:	adr	r12, proc_types
+#ifdef CONFIG_CPU_CP15
+		mrc	p15, 0, r9, c0, c0	@ get processor ID
+#elif defined(CONFIG_CPU_V7M)
+		/*
+		 * On v7-M the processor id is located in the V7M_SCB_CPUID
+		 * register, but as cache handling is IMPLEMENTATION DEFINED on
+		 * v7-M (if existant at all) we just return early here.
+		 * If V7M_SCB_CPUID were used the cpu ID functions (i.e.
+		 * __armv7_mmu_cache_{on,off,flush}) would be selected which
+		 * use cp15 registers that are not implemented on v7-M.
+		 */
+		bx	lr
+#else
+		ldr	r9, =CONFIG_PROCESSOR_ID
+#endif
+1:		ldr	r1, [r12, #0]		@ get value
+		ldr	r2, [r12, #4]		@ get mask
+		eor	r1, r1, r9		@ (real ^ match)
+		tst	r1, r2			@       & mask
+ ARM(		addeq	pc, r12, r3		) @ call cache function
+ THUMB(		addeq	r12, r3			)
+ THUMB(		moveq	pc, r12			) @ call cache function
+		add	r12, r12, #PROC_ENTRY_SIZE
+		b	1b
+
+----
+
+[source,text]
+----
+[r12 + 0] → cpu_id
+[r12 + 4] → mask
+[r12 + r3] → function
+----
+
+ARmv7 match occurs for and jumps to __armv7_mmu_cache_flush:
+This meand proc_types entry is unique per processor type and called cache flush function is also unique per processor type.
+
+[source,text]
+----
+/*
+ * Table for cache operations.  This is basically:
+ *   - CPU ID match
+ *   - CPU ID mask
+ *   - 'cache on' method instruction
+ *   - 'cache off' method instruction
+ *   - 'cache flush' method instruction
+ *
+ * We match an entry using: ((real_id ^ match) & mask) == 0
+ *
+ * Writethrough caches generally only need 'on' and 'off'
+ * methods.  Writeback caches _must_ have the flush method
+ * defined.
+ */
+		.align	2
+		.type	proc_types,#object
+proc_types:
+		.word	0x41000000		@ old ARM ID
+		.word	0xff00f000
+        ....
+        ....
+		.word	0x000f0000		@ new CPU Id
+		.word	0x000f0000
+		W(b)	__armv7_mmu_cache_on
+		W(b)	__armv7_mmu_cache_off
+		W(b)	__armv7_mmu_cache_flush
+----
+
+[source,gdb]
+----
+(gdb) 
+proc_types () at /usr/src/kernel/arch/arm/boot/compressed/head.S:1123
+1123    in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x40010694 <proc_types+356>: b       0x400107c4 <__armv7_mmu_cache_flush> <<<<
+   0x40010698 <proc_types+360>: andeq   r0, r0, r0
+   0x4001069c <proc_types+364>: andeq   r0, r0, r0
+   0x400106a0 <proc_types+368>: mov     pc, lr
+   0x400106a4 <proc_types+372>: mov     pc, lr
+   0x400106a8 <proc_types+376>: mov     pc, lr
+   0x400106ac:  nop     {0}
+   0x400106b0:  nop     {0}
+   0x400106b4:  nop     {0}
+   0x400106b8:  nop     {0}
+----
+
+[source,head.S]
+----
+__armv7_mmu_cache_flush:
+		enable_cp15_barriers	r10
+		tst	r4, #1
+		bne	iflush
+		mrc	p15, 0, r10, c0, c1, 5	@ read ID_MMFR1
+		tst	r10, #0xf << 16		@ hierarchical cache (ARMv7)
+		mov	r10, #0
+		beq	hierarchical
+		mcr	p15, 0, r10, c7, c14, 0	@ clean+invalidate D
+		b	iflush
+hierarchical:
+		dcache_line_size r1, r2		@ r1 := dcache min line size
+		sub	r2, r1, #1		@ r2 := line size mask
+		bic	r0, r0, r2		@ round down start to line size
+		sub	r11, r11, #1		@ end address is exclusive
+		bic	r11, r11, r2		@ round down end to line size
+0:		cmp	r0, r11			@ finished?
+		bgt	iflush
+		mcr	p15, 0, r0, c7, c14, 1	@ Dcache clean/invalidate by VA
+		add	r0, r0, r1
+		b	0b
+iflush:
+		mcr	p15, 0, r10, c7, c10, 4	@ DSB
+		mcr	p15, 0, r10, c7, c5, 0	@ invalidate I+BTB
+		mcr	p15, 0, r10, c7, c10, 4	@ DSB
+		mcr	p15, 0, r10, c7, c5, 4	@ ISB
+		mov	pc, lr
+----
+
+Lets understand proc_info structure for better understanding:
+
 🔹 **What is proc_info?**
 
 `proc_info` (often called `proc_info_list` in the kernel) is a per-CPU descriptor structure used very early during boot.
@@ -903,32 +1113,6 @@ struct proc_info_list {
 	void		 *unused;
 #endif
 };
-----
-
-[source,armasm]
-----
-/*
- * Clean and flush the cache to maintain consistency.
- *
- * On entry,
- *  r0 = start address
- *  r1 = end address (exclusive)
- * On exit,
- *  r1, r2, r3, r9, r10, r11, r12 corrupted
- * This routine must preserve:
- *  r4, r6, r7, r8
- */
-		.align	5
-cache_clean_flush:
-		mov	r3, #16             @ Call the function located at offset 16 inside each proc_types entry
-		mov	r11, r1             @ save end address
-		b	call_cache_fn
-
-call_cache_fn:
-		Detects which CPU you are running on
-		Walks through a table of supported CPUs (proc_types)
-		Finds a matching entry
-		Calls the correct cache operation function for that CPU
 ----
 
 [NOTE]
