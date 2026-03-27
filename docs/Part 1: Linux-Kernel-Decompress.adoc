@@ -1215,6 +1215,91 @@ r3  = BSS end
 r5  = appended DTB size (extra bump)
 ----
 
+=== Cache ON
+Did we skip the cache setup earlier? Do it now
+That is indicated by the LSB in r4
+
+[source,gdb]
+----
+(gdb) info registers r4 
+r4             0x40208001          1075871745
+(gdb)
+----
+
+[source,armasm]
+----
+cache_on:	mov	r3, #8			@ cache_on function
+		b	call_cache_fn
+----
+
+* `call_cache_fn`: call correct function based on CPU ID
+
+[source,gdb]
+----
+(gdb) info registers r2 r9 r1 r3 r12
+r2             0xf0000             983040
+r9             0x414fc0f0          1095745776
+r1             0x4140c0f0          1094762736
+r3             0x8                 8
+r12            0x41c7c3c4          1103610820
+(gdb) 
+----
+
+* Register r9 holds the CPU ID
+
+[source,cpuid]
+----
+Implementer: 0x41 → ARM
+Variant: 0x4 → r4
+Architecture: 0xF → ARMv7
+Part number: 0xC0F → Cortex-A15
+Revision: 0x0 → p0
+----
+
+* CPU ID matched with the armv7 and hence call the __armv7_mmu_cache_on function to turn on the cache
+
+[source,armasm]
+----
+.word	0x000f0000		@ new CPU Id
+.word	0x000f0000		<< mask
+W(b)	__armv7_mmu_cache_on
+W(b)	__armv7_mmu_cache_off
+W(b)	__armv7_mmu_cache_flush
+----
+[source,gdb]
+----
+si
+0x41c7c3cc in ?? ()
+1: x/10i $pc
+=> 0x41c7c3cc:  b       0x41c7c158
+   0x41c7c3d0:  b       0x41c7c45c
+   0x41c7c3d4:  b       0x41c7c504
+   0x41c7c3d8:  andeq   r0, r0, r0
+   0x41c7c3dc:  andeq   r0, r0, r0
+   0x41c7c3e0:  mov     pc, lr
+   0x41c7c3e4:  mov     pc, lr
+   0x41c7c3e8:  mov     pc, lr
+   0x41c7c3ec:  nop     {0}
+   0x41c7c3f0:  nop     {0}
+(gdb)
+----
+
+=> 0x41c7c3cc:  b       0x41c7c158 <<< __armv7_mmu_cache_on
+   0x41c7c3d0:  b       0x41c7c45c <<< __armv7_mmu_cache_off
+   0x41c7c3d4:  b       0x41c7c504 <<< __armv7_mmu_cache_flush
+
+* __armv7_mmu_cache_on function
+
+[source,armasm]
+----
+__armv7_mmu_cache_on:
+		....
+		....
+		blne	__setup_mmu
+----
+
+We will discuss __setup_mmu in Part 2 of this series
+
 === Calling decompress_kernel()
 
 With the C runtime ready, execution calls into `misc.c`:
