@@ -111,27 +111,31 @@ virtual memory manager builds a full, accurate page table hierarchy.
 
 [source]
 ----
-stext                           (arch/arm/kernel/head.S)
-  └─ __create_page_tables
-       └─ __armv7_mmu_cache_on
-            └─ __setup_mmu       ← this document
+# cache_on -> call_cache_fn -> __armv7_mmu_cache_on -> __setup_mmu
+
+cache_on () at /usr/src/kernel/arch/arm/boot/compressed/head.S:722
+722     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7c000 <cache_on>:       mov     r3, #8
+   0x41c7c004 <cache_on+4>:     b       0x41c7c24c <call_cache_fn>
+
+proc_types () at /usr/src/kernel/arch/arm/boot/compressed/head.S:1121
+1121    in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7c3cc <proc_types+348>: b       0x41c7c158 <__armv7_mmu_cache_on>
+   0x41c7c3d0 <proc_types+352>: b       0x41c7c45c <__armv7_mmu_cache_off>
+   0x41c7c3d4 <proc_types+356>: b       0x41c7c504 <__armv7_mmu_cache_flush>
+
+872     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7c178 <__armv7_mmu_cache_on+32>:        tst     r11, #15
+   0x41c7c17c <__armv7_mmu_cache_on+36>:        movne   r6, #14
+   0x41c7c180 <__armv7_mmu_cache_on+40>:        blne    0x41c7c09c <__setup_mmu>
 ----
 
 `__armv7_mmu_cache_on` detects whether the CPU implements VMSA (the standard
 paged MMU), sets up the RAM attribute register `r6`, then branches to
 `__setup_mmu`:
-
-[source,armasm]
-----
-__armv7_mmu_cache_on:
-    enable_cp15_barriers  r11
-    mov   r12, lr
-#ifdef CONFIG_MMU
-    mrc   p15, 0, r11, c0, c1, 4    @ read ID_MMFR0
-    tst   r11, #0xf                  @ VMSA capable?
-    movne r6, #CB_BITS | 0x02       @ r6 = RAM attrs: C|B + !XN (= 0x0e)
-    blne  __setup_mmu                @ build the page table
-----
 
 `r6` is the key hand-off value.  `CB_BITS` evaluates to `0x0C` (C=1, B=1),
 so `r6 = 0x0E` — exactly the `...c0e` suffix seen in the GDB dumps for RAM
@@ -829,6 +833,21 @@ mrc   p15, 0, r0, c1, c0, 0    @ read back (forces write to complete)
 mov   r0, #0
 mcr   p15, 0, r0, c7, c5, 4    @ ISB — guarantee next fetch uses MMU
 mov   pc, r12                   @ return (first instruction translated by MMU)
+----
+
+[source,gdb]
+----
+(gdb) info registers r0 r1 TTBCR SCTLR TTBR0 TTBR1 TTBR0_EL1 TTBR1_EL1 r6
+r0             0x0                 0
+r1             0xfffffffd          -3
+TTBCR          0x0                 0
+SCTLR          0xc5507d            12931197
+TTBR0          0x40204000          1075855360
+TTBR1          0x0                 0
+TTBR0_EL1      0x40204000          1075855360
+TTBR1_EL1      0x0                 0
+r6             0x0                 0
+(gdb)
 ----
 
 The first ISB flushes any instructions already in the fetch/decode stages that

@@ -908,75 +908,87 @@ first — each word is safely consumed before the destination pointer could alia
 This guarantees correctness even when source and destination partially overlap.
 ====
 
-=== Jumping to Relocated Code
+=== Jumping to Relocated Code:
 
-After the copy the decompressor flushes the D-cache and branches to the relocated
+After copy the decompressor code to the new location it flushes the D-cache and branches to the relocated
 `restart:` entry:
 
-[source,armasm]
-----
-    mov     r0, r9              @ start of relocated zImage
-    add     r1, sp, r6          @ end of relocated zImage
-    bl      cache_clean_flush   @ flush D-cache over copied range
+I did some modification in the kernel and due that you will see some disperency in addresssing hence addresses got changed.
+This is expected address of restart label after relocation  `0x41B7A600 + offset` but `restart` label new address is `0x41c7bd40`.
 
-    badr    r0, restart         @ PC-relative address of restart:
-    add     r0, r0, r6          @ apply relocation delta
-    mov     pc, r0              @ JUMP to relocated restart: at 0x41B7A600+offset
+[source]
+----
+(gdb) add-symbol-file build/arch/arm/boot/compressed/vmlinux 0x41c7bd40
+add symbol table from file "build/arch/arm/boot/compressed/vmlinux" at
+        .text_addr = 0x41c7bd40
+(y or n) y
+Reading symbols from build/arch/arm/boot/compressed/vmlinux...
+(gdb) si
+
+=> 0x41c7be20 <restart+4>:      ldr     sp, [r0]
+   0x41c7be24 <restart+8>:      ldr     r6, [r0, #4]
+   0x41c7be28 <restart+12>:     add     sp, sp, r0
+(gdb)
 ----
 
-Do you know: `cache functions` selects the correct cache-enable routine from the `proc_types` table
-by matching the CPU ID register .  This handles all ARM variants from ARMv4 through ARMv7. we are going to understand this flow now.
+You can notice that in starting of the document we are loading the kernel at `0x40010000` but now we are jumping to `0x41c7bd40`.
+Restart address also changed.
+
+
+Step 1: Setup stack pointer with relocated address.
+
+Step 2: Setup malloc heap with relocated address.
+
+Step 3: Flush cache
+
+
+==== flush cache operation
+
+Do you know: `cache functions` selects the correct cache-enable routine from the `proc_types` table by matching the CPU ID register .
+This handles all ARM variants from ARMv4 through ARMv7. we are going to understand this flow now.
 Reference: https://elixir.bootlin.com/linux/v6.10/source/arch/arm/boot/compressed/head.S#L1259
 
+* Read CPU ID from CP15 register.
 
-Trace the `cache_clean_flush` function.
+[source,gdb]
+----
+(gdb) info registers r2 r9 r1
+r9             0x414fc0f0          1095745776
+(gdb) 
+----
+
+[source,cpuid]
+----
+Implementer: 0x41 → ARM
+Variant: 0x4 → r4
+Architecture: 0xF → ARMv7
+Part number: 0xC0F → Cortex-A15
+Revision: 0x0 → p0
+----
+
+* Trace the `cache_clean_flush` function.
 
 [source,armasm]
 ----
-/*
- * Clean and flush the cache to maintain consistency.
- *
- * On entry,
- *  r0 = start address
- *  r1 = end address (exclusive)
- * On exit,
- *  r1, r2, r3, r9, r10, r11, r12 corrupted
- * This routine must preserve:
- *  r4, r6, r7, r8
- */
-		.align	5
 cache_clean_flush:
-		mov	r3, #16             @ Call the function located at offset 16 inside each proc_types entry
-		mov	r11, r1             @ save end address
+        ....
+        ....
 		b	call_cache_fn
 
 call_cache_fn:
-		Detects which CPU you are running on
-		Walks through a table of supported CPUs (proc_types)
-		Finds a matching entry
-		Calls the correct cache operation function for that CPU
+		1. Detects which CPU you are running on
+		2. Walks through a table of supported CPUs (proc_types)
+		3. Finds a matching entry
+		4. Calls the correct cache operation function for that CPU
 ----
 
 Here is the loop to find the correct cache operation function for the CPU:
 
 [source,armasm]
 ----
-call_cache_fn:	adr	r12, proc_types
-#ifdef CONFIG_CPU_CP15
+call_cache_fn:
 		mrc	p15, 0, r9, c0, c0	@ get processor ID
-#elif defined(CONFIG_CPU_V7M)
-		/*
-		 * On v7-M the processor id is located in the V7M_SCB_CPUID
-		 * register, but as cache handling is IMPLEMENTATION DEFINED on
-		 * v7-M (if existant at all) we just return early here.
-		 * If V7M_SCB_CPUID were used the cpu ID functions (i.e.
-		 * __armv7_mmu_cache_{on,off,flush}) would be selected which
-		 * use cp15 registers that are not implemented on v7-M.
-		 */
-		bx	lr
-#else
 		ldr	r9, =CONFIG_PROCESSOR_ID
-#endif
 1:		ldr	r1, [r12, #0]		@ get value
 		ldr	r2, [r12, #4]		@ get mask
 		eor	r1, r1, r9		@ (real ^ match)
@@ -986,7 +998,6 @@ call_cache_fn:	adr	r12, proc_types
  THUMB(		moveq	pc, r12			) @ call cache function
 		add	r12, r12, #PROC_ENTRY_SIZE
 		b	1b
-
 ----
 
 [source,text]
@@ -999,35 +1010,33 @@ call_cache_fn:	adr	r12, proc_types
 ARmv7 match occurs for and jumps to __armv7_mmu_cache_flush:
 This meand proc_types entry is unique per processor type and called cache flush function is also unique per processor type.
 
-[source,text]
+* This is how proc_types table looks like:
+
 ----
-/*
  * Table for cache operations.  This is basically:
  *   - CPU ID match
  *   - CPU ID mask
  *   - 'cache on' method instruction
  *   - 'cache off' method instruction
  *   - 'cache flush' method instruction
- *
- * We match an entry using: ((real_id ^ match) & mask) == 0
- *
- * Writethrough caches generally only need 'on' and 'off'
- * methods.  Writeback caches _must_ have the flush method
- * defined.
- */
-		.align	2
-		.type	proc_types,#object
+----
+
+[source,text]
+----
 proc_types:
-		.word	0x41000000		@ old ARM ID
-		.word	0xff00f000
-        ....
-        ....
 		.word	0x000f0000		@ new CPU Id
 		.word	0x000f0000
 		W(b)	__armv7_mmu_cache_on
 		W(b)	__armv7_mmu_cache_off
 		W(b)	__armv7_mmu_cache_flush
 ----
+
+[NOTE]
+====
+https://github.com/torvalds/linux/blob/453a4a5f97f0c95b7df458e6afb98d4ab057d90b/arch/arm/boot/compressed/head.S#L993
+====
+
+* __armv7_mmu_cache_flush function is called.
 
 [source,gdb]
 ----
@@ -1047,37 +1056,8 @@ proc_types () at /usr/src/kernel/arch/arm/boot/compressed/head.S:1123
    0x400106b8:  nop     {0}
 ----
 
-[source,head.S]
-----
-__armv7_mmu_cache_flush:
-		enable_cp15_barriers	r10
-		tst	r4, #1
-		bne	iflush
-		mrc	p15, 0, r10, c0, c1, 5	@ read ID_MMFR1
-		tst	r10, #0xf << 16		@ hierarchical cache (ARMv7)
-		mov	r10, #0
-		beq	hierarchical
-		mcr	p15, 0, r10, c7, c14, 0	@ clean+invalidate D
-		b	iflush
-hierarchical:
-		dcache_line_size r1, r2		@ r1 := dcache min line size
-		sub	r2, r1, #1		@ r2 := line size mask
-		bic	r0, r0, r2		@ round down start to line size
-		sub	r11, r11, #1		@ end address is exclusive
-		bic	r11, r11, r2		@ round down end to line size
-0:		cmp	r0, r11			@ finished?
-		bgt	iflush
-		mcr	p15, 0, r0, c7, c14, 1	@ Dcache clean/invalidate by VA
-		add	r0, r0, r1
-		b	0b
-iflush:
-		mcr	p15, 0, r10, c7, c10, 4	@ DSB
-		mcr	p15, 0, r10, c7, c5, 0	@ invalidate I+BTB
-		mcr	p15, 0, r10, c7, c10, 4	@ DSB
-		mcr	p15, 0, r10, c7, c5, 4	@ ISB
-		mov	pc, lr
-----
-
+[NOTE]
+====
 Lets understand proc_info structure for better understanding:
 
 🔹 **What is proc_info?**
@@ -1086,43 +1066,7 @@ Lets understand proc_info structure for better understanding:
 👉 It tells the kernel:
 How to identify a CPU
 Which functions to use for that CPU (cache, MMU, etc.)
-
-[source,c]
-----
-/*
- * Note!  struct processor is always defined if we're
- * using MULTI_CPU, otherwise this entry is unused,
- * but still exists.
- *
- * NOTE! The following structure is defined by assembly
- * language, NOT C code.  For more information, check:
- *  arch/arm/mm/proc-*.S and arch/arm/kernel/head-armv.S
- */
-struct proc_info_list {
-	unsigned int	 cpu_val;
-	unsigned int	 cpu_mask;
-	unsigned long	 __cpu_mmu_flags;	/* used by head-armv.S */
-	unsigned long	 __cpu_flush;		/* used by head-armv.S */
-	const char	 *arch_name;
-	const char	 *elf_name;
-	unsigned int	 elf_hwcap;
-	struct proc_info_item *info;
-#ifdef MULTI_CPU
-	struct processor *proc;
-#else
-	void		 *unused;
-#endif
-};
-----
-
-[NOTE]
 ====
-The relocated `restart:` re-executes the stack/malloc setup (`sp`, `r6`, `r10`)
-but now at the new high-memory addresses.  It then falls straight through the
-overwrite checks (which now both pass) into `wont_overwrite:`.
-====
-
-'''
 
 == wont_overwrite: — GOT Fixup, BSS Clear, and Decompression
 
@@ -1184,10 +1128,6 @@ got:
     .long   _end                @ end of BSS
 ---- 
 
-----
-new_address = old_address(r1) + delta(r0)
-----
-
 === BSS Clear
 
 All uninitialized global variables in `misc.c` live in `.bss`.
@@ -1226,35 +1166,17 @@ r4             0x40208001          1075871745
 (gdb)
 ----
 
-[source,armasm]
+[source,gdb]
 ----
-cache_on:	mov	r3, #8			@ cache_on function
-		b	call_cache_fn
+cache_on () at /usr/src/kernel/arch/arm/boot/compressed/head.S:722
+722     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7c000 <cache_on>:       mov     r3, #8
+   0x41c7c004 <cache_on+4>:     b       0x41c7c24c <call_cache_fn>
 ----
 
 * `call_cache_fn`: call correct function based on CPU ID
-
-[source,gdb]
-----
-(gdb) info registers r2 r9 r1 r3 r12
-r2             0xf0000             983040
-r9             0x414fc0f0          1095745776
-r1             0x4140c0f0          1094762736
-r3             0x8                 8
-r12            0x41c7c3c4          1103610820
-(gdb) 
-----
-
-* Register r9 holds the CPU ID
-
-[source,cpuid]
-----
-Implementer: 0x41 → ARM
-Variant: 0x4 → r4
-Architecture: 0xF → ARMv7
-Part number: 0xC0F → Cortex-A15
-Revision: 0x0 → p0
-----
+This section we have already discussed in cache_clean_flush function.
 
 * CPU ID matched with the armv7 and hence call the __armv7_mmu_cache_on function to turn on the cache
 
@@ -1268,102 +1190,65 @@ W(b)	__armv7_mmu_cache_flush
 ----
 [source,gdb]
 ----
-si
-0x41c7c3cc in ?? ()
+(gdb) 
+proc_types () at /usr/src/kernel/arch/arm/boot/compressed/head.S:1121
+1121    in /usr/src/kernel/arch/arm/boot/compressed/head.S
 1: x/10i $pc
-=> 0x41c7c3cc:  b       0x41c7c158
-   0x41c7c3d0:  b       0x41c7c45c
-   0x41c7c3d4:  b       0x41c7c504
-   0x41c7c3d8:  andeq   r0, r0, r0
-   0x41c7c3dc:  andeq   r0, r0, r0
-   0x41c7c3e0:  mov     pc, lr
-   0x41c7c3e4:  mov     pc, lr
-   0x41c7c3e8:  mov     pc, lr
+=> 0x41c7c3cc <proc_types+348>: b       0x41c7c158 <__armv7_mmu_cache_on>
+   0x41c7c3d0 <proc_types+352>: b       0x41c7c45c <__armv7_mmu_cache_off>
+   0x41c7c3d4 <proc_types+356>: b       0x41c7c504 <__armv7_mmu_cache_flush>
+   0x41c7c3d8 <proc_types+360>: andeq   r0, r0, r0
+   0x41c7c3dc <proc_types+364>: andeq   r0, r0, r0
+   0x41c7c3e0 <proc_types+368>: mov     pc, lr
+   0x41c7c3e4 <proc_types+372>: mov     pc, lr
+   0x41c7c3e8 <proc_types+376>: mov     pc, lr
    0x41c7c3ec:  nop     {0}
    0x41c7c3f0:  nop     {0}
+----
+
+* Execute the `__armv7_mmu_cache_on` function.
+
+[source,armasm]
+----
+872     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7c178 <__armv7_mmu_cache_on+32>:        tst     r11, #15
+   0x41c7c17c <__armv7_mmu_cache_on+36>:        movne   r6, #14
+   0x41c7c180 <__armv7_mmu_cache_on+40>:        blne    0x41c7c09c <__setup_mmu>
+----
+
+We will discuss `__setup_mmu` in Part 2 of this series because this section capture details of settingup MMU and page table.
+
+=== malloc space above stack
+
+[source,gdb]
+----
+not_relocated () at /usr/src/kernel/arch/arm/boot/compressed/head.S:630
+630     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7bf68 <not_relocated+40>:       mov     r0, r4
+   0x41c7bf6c <not_relocated+44>:       mov     r1, sp
+   0x41c7bf70 <not_relocated+48>:       add     r2, sp, #65536  @ 0x10000
+   0x41c7bf74 <not_relocated+52>:       mov     r3, r7
+
+----
+
+ *   r4  = kernel execution address
+ *   r7  = architecture ID
+ *   r8  = atags pointer
+
+[source,gdb]
+----
+(gdb) info registers r4 r7 r8 r0 r2
+r4             0x40208000          1075871744
+r7             0xffffffff          -1
+r8             0x48000000          1207959552
+r0             0x40208000          1075871744
+r2             0x426c3b48          1114389320
 (gdb)
 ----
 
-=> 0x41c7c3cc:  b       0x41c7c158 <<< __armv7_mmu_cache_on
-   0x41c7c3d0:  b       0x41c7c45c <<< __armv7_mmu_cache_off
-   0x41c7c3d4:  b       0x41c7c504 <<< __armv7_mmu_cache_flush
 
-* __armv7_mmu_cache_on function
-
-[source,armasm]
-----
-__armv7_mmu_cache_on:
-		....
-		....
-		blne	__setup_mmu
-----
-
-We will discuss __setup_mmu in Part 2 of this series
-
-=== Calling decompress_kernel()
-
-With the C runtime ready, execution calls into `misc.c`:
-
-[source,armasm]
-----
-    mov     r0, r4              @ r0 = ZRELADDR (output start = 0x40208000)
-    mov     r1, sp              @ r1 = malloc base (stack top)
-    add     r2, sp, #MALLOC_SIZE @ r2 = malloc end (+ 64 KiB)
-    mov     r3, r7              @ r3 = architecture ID
-    bl      decompress_kernel   @ call into misc.c
-----
-
-.decompress_kernel() function signature in misc.c
-image::../../images/decompress-kernel-function.png[Decompress kernel function, 640, align=center]
-
-The call chain inside `misc.c`:
-
-. `decompress_kernel(output, heap_base, heap_end, arch_id, delta)`
-. → `do_decompress(input_data, input_len, output, error)`
-. → `__decompress(input, in_len, NULL, NULL, output, 0, NULL, error)`
-. → Format-specific decompressor from `lib/decompress_*.c`
-  (gzip, lzma, xz, lzo, lz4 — whichever was selected in Kconfig)
-
-[TIP]
-====
-Enable `CONFIG_DEBUG_UNCOMPRESS` to print a UART progress banner:
-
-[source]
-----
-Uncompressing Linux... done, booting the kernel.
-----
-
-This is the cheapest possible smoke-test that `CONFIG_DEBUG_LL` and
-`DEBUG_UART_PHYS` are correctly configured.
-====
-
-After decompression, ~25.4 MiB of uncompressed kernel code and data is now at
-`0x40208000`.
-
-.Physical RAM layout after decompress_kernel() returns
-image::../../images/diag-after-decompress.png[After decompress, 680, align=center]
-
-'''
-
-[[enter_kernel]]
-== Cache Flush, Cache Off, and __enter_kernel
-
-=== Flush and Turn Off Caches
-
-The decompressor flushes the D-cache over the newly-written kernel image (to make
-it coherent for instruction fetch), then disables the MMU and caches as required
-by the ARM booting ABI:
-
-[source,armasm]
-----
-    get_inflated_image_size r1, r2, r3  @ r1 = end address of inflated kernel
-    mov     r0, r4                      @ r0 = start = ZRELADDR
-    bl      cache_clean_flush           @ flush D-cache over entire kernel image
-    bl      cache_off                   @ disable MMU, I-cache, D-cache
-----
-
-`cache_off` selects the correct disable sequence from `proc_types` based on the
-CPU ID, invalidates TLBs where applicable, and issues DSB/ISB barriers.
 
 === __enter_kernel — Final Register Restore and Jump
 

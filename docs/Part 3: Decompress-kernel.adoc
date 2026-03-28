@@ -1,0 +1,199 @@
+=== Calling decompress_kernel()
+
+With the C runtime ready, execution calls into `misc.c`:
+
+[source,armasm]
+----
+    mov     r0, r4              @ r0 = ZRELADDR (output start = 0x40208000)
+    mov     r1, sp              @ r1 = malloc base (stack top)
+    add     r2, sp, #MALLOC_SIZE @ r2 = malloc end (+ 64 KiB)
+    mov     r3, r7              @ r3 = architecture ID
+    bl      decompress_kernel   @ call into misc.c
+----
+
+.decompress_kernel() function signature in misc.c
+image::../../images/decompress-kernel-function.png[Decompress kernel function, 640, align=center]
+
+[source,gdb]
+----
+(gdb) si
+634     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7bf78 <not_relocated+56>:       bl      0x41c7c6c4 <decompress_kernel>
+   0x41c7bf7c <not_relocated+60>:       add     r1, pc, #120    @ 0x78
+   0x41c7bf80 <not_relocated+64>:       ldr     r2, [r1]
+(gdb)
+----
+
+The call chain inside `misc.c`:
+
+. `decompress_kernel(output, heap_base, heap_end, arch_id, delta)`
+. → `do_decompress(input_data, input_len, output, error)`
+. → `__decompress(input, in_len, NULL, NULL, output, 0, NULL, error)`
+. → Format-specific decompressor from `lib/decompress_*.c`
+  (gzip, lzma, xz, lzo, lz4 — whichever was selected in Kconfig)
+
+[source,gdb]
+----
+(gdb)
+decompress_kernel (output_start=1075871744, free_mem_ptr_p=1114323784,
+    free_mem_ptr_end_p=1114389320, arch_id=-1)
+    at /usr/src/kernel/arch/arm/boot/compressed/misc.c:138
+warning: 138    /usr/src/kernel/arch/arm/boot/compressed/misc.c: No such file or directory
+1: x/10i $pc
+=> 0x41c7c6c4 <decompress_kernel>:
+    ldr r12, [pc, #168] @ 0x41c7c774 <decompress_kernel+176>
+   0x41c7c6c8 <decompress_kernel+4>:    push    {lr}            @ (str lr, [sp, #-4]!)
+(gdb) 
+----
+
+* __gunzip()
+
+[source,gdb]
+----
+(gdb) 
+__gunzip (fill=0x0, flush=0x0, out_len=-1075871745, pos=0x0, buf=0x41c82e6c "\037\213\b", 
+    len=10681486, 
+    out_buf=0x40208000 "\036\231;?DWX\310;+\372ۏp\336X+\373\3751\026\2034m,lq\350W]s\237\r\034
+\262$\374\271Θ\261,\231b\003_:\263/O\203uӥR\316/J\371\336qW~{\233\370\005j\314\342KOl\023/W\32
+7\355\245}6\361\350R\251\313e\323\370m\021\a\2224\357\214\337S_$\222~\226_\306d\236]\245\221\0
+17;h\354'ɱ\233r\314\330\301\277\353Ŀ\246憦\261l\335\312v\n\310\v\021q \031\343:\202\366\262\26
+5B\332C\271>\004\366\262\260\324m\032c\222g\202/\001\367\024\270G\351\320o\306=M\3633#֟yh\275U\
+251b\337\377pu\037\037\334r\365\261\376\244", <incomplete sequence \315>..., 
+    error=0x41c7c670 <error>) at /usr/src/kernel/lib/decompress_inflate.c:60
+warning: 60     /usr/src/kernel/lib/decompress_inflate.c: No such file or directory
+1: x/10i $pc
+=> 0x41c7ed28 <do_decompress+20>:       bne     0x41c7ed40 <do_decompress+44>
+   0x41c7ed2c <do_decompress+24>:
+    ldr r0, [pc, #620]  @ 0x41c7efa0 <do_decompress+652>
+   0x41c7ed30 <do_decompress+28>:       add     r0, pc, r0
+   0x41c7ed34 <do_decompress+32>:       blx     r3
+   0x41c7ed38 <do_decompress+36>:       mvn     r6, #0
+   0x41c7ed3c <do_decompress+40>:       b       0x41c7ef94 <do_decompress+640>
+   0x41c7ed40 <do_decompress+44>:       cmp     r0, #0
+   0x41c7ed44 <do_decompress+48>:       mov     r5, r0
+   0x41c7ed48 <do_decompress+52>:       movne   r6, r1
+   0x41c7ed4c <do_decompress+56>:       movne   r10, r0
+(gdb)
+----
+
+[source,gdb]
+----
+(gdb) 
+0x41c7d4e4      66      in /usr/src/kernel/lib/zlib_inflate/inflate.c
+1: x/10i $pc
+=> 0x41c7d4e4 <zlib_inflateInit2+12>:   ldr     r2, [r0, #32]
+   0x41c7d4e8 <zlib_inflateInit2+16>:   cmp     r1, r3
+   0x41c7d4ec <zlib_inflateInit2+20>:   str     r3, [r0, #24]
+   0x41c7d4f0 <zlib_inflateInit2+24>:   rsblt   r1, r1, #0
+   0x41c7d4f4 <zlib_inflateInit2+28>:   asrge   r3, r1, #4
+   0x41c7d4f8 <zlib_inflateInit2+32>:   sub     r12, r1, #8
+   0x41c7d4fc <zlib_inflateInit2+36>:   addge   r3, r3, #1
+   0x41c7d500 <zlib_inflateInit2+40>:   str     r2, [r0, #28]
+   0x41c7d504 <zlib_inflateInit2+44>:   cmp     r12, #7
+   0x41c7d508 <zlib_inflateInit2+48>:   str     r3, [r2, #8]
+(gdb)
+----
+
+[TIP]
+====
+Enable `CONFIG_DEBUG_UNCOMPRESS` to print a UART progress banner:
+
+[source]
+----
+Uncompressing Linux... done, booting the kernel.
+----
+
+This is the cheapest possible smoke-test that `CONFIG_DEBUG_LL` and
+`DEBUG_UART_PHYS` are correctly configured.
+====
+
+After decompression, ~25.4 MiB of uncompressed kernel code and data is now at
+`0x40208000`.
+
+.Physical RAM layout after decompress_kernel() returns
+image::../../images/diag-after-decompress.png[After decompress, 680, align=center]
+
+'''
+
+[[enter_kernel]]
+== Cache Flush, Cache Off, and __enter_kernel
+
+=== Flush and Turn Off Caches
+
+The decompressor flushes the D-cache over the newly-written kernel image (to make
+it coherent for instruction fetch), then disables the MMU and caches as required
+by the ARM booting ABI:
+
+[source,armasm]
+----
+    get_inflated_image_size r1, r2, r3  @ r1 = end address of inflated kernel
+    mov     r0, r4                      @ r0 = start = ZRELADDR
+    bl      cache_clean_flush           @ flush D-cache over entire kernel image
+    bl      cache_off                   @ disable MMU, I-cache, D-cache
+----
+
+[source,gdb]
+----
+638     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7bfa4 <not_relocated+100>:      mov     r0, r4
+   0x41c7bfa8 <not_relocated+104>:      add     r1, r1, r0
+   0x41c7bfac <not_relocated+108>:      bl      0x41c7c480 <cache_clean_flush>
+   0x41c7bfb0 <not_relocated+112>:      bl      0x41c7c400 <cache_off>
+   0x41c7bfb4 <not_relocated+116>:      mrs     r0, SPSR
+   0x41c7bfb8 <not_relocated+120>:      and     r0, r0, #31
+   0x41c7bfbc <not_relocated+124>:      cmp     r0, #26
+   0x41c7bfc0 <not_relocated+128>:      bne     0x41c7c660 <__enter_kernel>
+   0x41c7bfc4 <not_relocated+132>:      movw    r0, #1644       @ 0x66c
+   0x41c7bfc8 <not_relocated+136>:      movt    r0, #0
+
+----
+
+`cache_off` selects the correct disable sequence from `proc_types` based on the
+CPU ID, invalidates TLBs where applicable, and issues DSB/ISB barriers.
+
+[source,gdb]
+----
+=> 0x41c7bfb4 <not_relocated+116>:      mrs     r0, SPSR
+   0x41c7bfb8 <not_relocated+120>:      and     r0, r0, #31
+   0x41c7bfbc <not_relocated+124>:      cmp     r0, #26
+   0x41c7bfc0 <not_relocated+128>:      bne     0x41c7c660 <__enter_kernel>
+(gdb)
+----
+
+[source,gdb]
+----
+(gdb)
+not_relocated () at /usr/src/kernel/arch/arm/boot/compressed/head.S:644
+644     in /usr/src/kernel/arch/arm/boot/compressed/head.S
+1: x/10i $pc
+=> 0x41c7bfb4 <not_relocated+116>:      mrs     r0, SPSR
+   0x41c7bfb8 <not_relocated+120>:      and     r0, r0, #31
+   0x41c7bfbc <not_relocated+124>:      cmp     r0, #26
+   0x41c7bfc0 <not_relocated+128>:      bne     0x41c7c660 <__enter_kernel>
+   0x41c7bfc4 <not_relocated+132>:      movw    r0, #1644       @ 0x66c
+   0x41c7bfc8 <not_relocated+136>:      movt    r0, #0
+   0x41c7bfcc <not_relocated+140>:      add     r0, r0, pc
+   0x41c7bfd0 <not_relocated+144>:      bl      0x41c7f308 <__hyp_set_vectors>
+   0x41c7bfd4 <not_relocated+148>:      hvc     0
+   0x41c7bfd8 <not_relocated+152>:      b       0x41c7bfd8 <not_relocated+152>
+(gdb) 
+^C
+Thread 4 received signal SIGINT, Interrupt.
+[Switching to Thread 1.4]
+0xc031a308 in ?? ()
+1: x/10i $pc
+=> 0xc031a308:  bx      lr
+   0xc031a30c:  nop     {0}
+   0xc031a310:  bx      lr
+   0xc031a314:  mrc     15, 0, r3, cr0, cr0, {1}
+   0xc031a318:  lsr     r3, r3, #16
+   0xc031a31c:  and     r3, r3, #15
+   0xc031a320:  mov     r2, #4
+   0xc031a324:  lsl     r2, r2, r3
+   0xc031a328:  mcr     15, 0, r0, cr7, cr10, {1}
+   0xc031a32c:  add     r0, r0, r2
+(gdb) 
+
+----
