@@ -1,4 +1,4 @@
-= ARM32 Early Boot: the MMU setup
+= Part 2: Linux Kernel Early Boot (setup MMU)
 :doctype: article
 :toc: left
 :toclevels: 4
@@ -12,20 +12,120 @@
 :experimental:
 :xrefstyle: short
 
-In this post I will discuss initial mmu setup happens after the kernel is decompressed and before it jumps to the generic kernel code.
+In part 1 we discussed the build process and the zImage generation. Also explained the flow of compressed head.S till it relocates itself and again setup the stack, heap and cache using cache_on(). 
+
+In this part 2, we will see how mmu is setup. As this is the important part of the kernel boot process, and also explains how page table works, I will capture details about how page table works and cover arm32 MMU concepts using the qemu based booting process and from the arm developer manual to get the insights of how translation table works.
 
 Source:    https://elixir.bootlin.com/linux/v6.1.128/source/arch/arm/boot/compressed/head.S
 
 ---
-== Basic ARM32 MMU concepts
+== abbrivations
 
-The ARM mmu can be used in many different ways.
+= Linux Page Table Abbreviations
 
-In the most general case it is a 2 level MMU with 4k pages (as an example). This is how something like the Linux operating system might use it.
+[cols="1,2,4,1", options="header"]
+|===
+| Abbreviation | Full Form | Description | ARM32 Usage
 
-The way QEMU emulated ARM32 uses it is as a 1 level MMU with 1M "sections". QEMU's aim is to make it transparent and forget about it. You might ask, "why not just turn it off entirely", but as near as I can tell that will not allow caches to be enabled. Also mapping as much of the address space as possible "invalid" will catch certain bugs.
+| pgd / pgd_t / pgdval_t
+| Page Global Directory
+| Top-level page table in Linux. Kernel’s main PGD is `swapper_pg_dir`.
+| Yes
+
+| p4d / p4d_t / p4dval_t
+| Page Level 4 Directory
+| Added for 5-level paging after `pud`. Helps generalize hierarchy levels.
+| No
+
+| pud / pud_t / pudval_t
+| Page Upper Directory
+| Introduced for 4-level paging abstraction.
+| No
+
+| pmd / pmd_t / pmdval_t
+| Page Middle Directory
+| Intermediate level between PGD and PTE.
+| Yes
+
+| pte / pte_t / pteval_t
+| Page Table Entry
+| Final level entry mapping to physical pages.
+| Yes
+
+| pfn
+| Page Frame Number
+| Unique number identifying a physical page (e.g., address `0x00000000` → PFN 0).
+| Yes
+
+|===
+
+== ARM32 MMU concepts
+
+* the ARM32 architecture with a classic MMU has 2 levels of page tables and the more recent LPAE (Large Physical Address Extension) MMU has 3 levels of page tables.
+* On some ARMv7 architectue have LPAE MMU but only conditionally enabled.By default it is disabled and classic 2 level MMU is used.
+
+But let’s first discuss how Linux see the world of paging.
+
+image::../../images/virtual_address_translation_32bit.svg[Virtual Address Translation 32bit, 740, align=center]
+
+* Each of the entities PGD, P4D … etc are arrays of pointers. The PTE despite having a singular form also contain several pointers.
+* in this document we will only capture ARM32 which has 2 or 3 levels of page tables but still good to know about the 4 levels of page tables.
+
+=== classic ARM32 paging setup
+* Linux folds P4D and PUD, providing 2048 pointers per PGD, 1 pointer per PMD and 512 pointers per PTE.
+
+[source,text]
+----
+Level 1: Page Global Directory (PGD) - 2048 entries (2^11)
+Level 2: Page Middle Directory (PMD) - 2048 entries (2^11)
+# PGD and PMD are one to one mapped in case of classic ARM32 paging setup makeing it behave like 2 level paging setup.
+# This is not true for LPAE paging setup.
+Level 3: Page Table Entry (PTE) - 512 entries (2^9)
+----
+
+Now , how much memory does each level cover?
+
+[source,text]
+----
+# Total memory covered
+# PGD(1) * PMD(2048) * PTE(512) * Page Size(4KB) = 4GB
+2048 entries * 512 entries * 4KB = 4GB
+# PGD: 11 bits PMD: 11 bits PTE: 9 bits Offset: 12 bits
+----
+
+[NOTE]
+====
+The classic ARM32 paging setup in Linux folds P4D and PUD, providing 2048 pointers per PGD, 1 pointer per PMD and 512 pointers per PTE. It uses 3 levels of the hierarchy while ARM32 hardware only has two.
+====
+
+image::../../images/linux_page_table_hierarchy.svg[Linux Page Table Hierarchy, 740, align=center]
+
+===  LPAE (Large Physical Address Extension) paging setup
+Each PGD has 4 pointers covering 1GB each (for a total of 4GB of memory) and 512 pointers per PMD dividing each 1GB into 2MB chunks, then 512 pointers per PTE dividing the 2MB chunks into 4KB chunks (pages).
+
+[source,text]
+----
+# Total memory covered
+# PGD(4) * PMD(512) * PTE(512) * Page Size(4KB) = 4GB
+4 * 512 * 512 * 4KB = 4GB
+# PGD: 2 bits | PMD: 9 bits | PTE: 9 bits | Offset: 12 bits
+----
+
+image::../../images/pgd_pmd_pte_hierarchy_4entry.svg[PGD PMD PTE Hierarchy 4 entry, 740, align=center]
+
+Reference from the kernel code: https://github.com/torvalds/linux/blob/cbfffcca2bf0622b601b7eaf477aa29035169184/include/linux/pgtable.h#L125
+
+[source,kernel]
+----
+static inline pmd_t *pmd_off(struct mm_struct *mm, unsigned long va)
+{
+        return pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, va), va), va), va);
+}
+----
 
 === Translation table
+
+The virtual address for the kernespace global page directory is PAGE_OFFSET+0x4000. On ARM32 this base address, in physical memory, is set in TTBR0 (Translation Table Base Register). Linux uses the symbol swapper_pg_dir for this address.
 
 The translation table must begin on a 16K boundary. When a virtual address needs to be translated, the top 12 bits of that address select the first level entry in the translation table. Hence each first level entry deals with 1M of the virtual address space. Each entry is 32 bits in size.
 There are 4 types of table entries as indicated by the low 2 bits of the entry:
@@ -54,9 +154,7 @@ The diagram shows the complete identity mapping (VA = PA) that __setup_mmu build
 
 === Where execution begins
 
-After the compressed kernel is decompressed, control passes to the physical
-address of `stext` in `arch/arm/kernel/head.S`.  At this point the CPU is
-running entirely in physical memory — MMU off, caches off, no page tables.
+After the compressed kernel is decompressed, control passes to the physical address of `stext` in `arch/arm/kernel/head.S`.  At this point the CPU is running entirely in physical memory — MMU off, caches off, no page tables.
 
 The very first task is to build a minimal translation table, load it into the
 MMU hardware registers, then switch the program counter from a physical address
@@ -107,7 +205,9 @@ corresponding physical offset (e.g. `0x40204000` in this debug session) this
 virtual memory manager builds a full, accurate page table hierarchy.
 ====
 
-=== Call chain leading to `__setup_mmu`
+== __setup_mmu
+
+This is called before the decompressor starts executing in virtual memory. cache_on() is called from head.S to enable the cache so that can speed up the execution of the decompressor.
 
 [source]
 ----
@@ -119,6 +219,7 @@ cache_on () at /usr/src/kernel/arch/arm/boot/compressed/head.S:722
 => 0x41c7c000 <cache_on>:       mov     r3, #8
    0x41c7c004 <cache_on+4>:     b       0x41c7c24c <call_cache_fn>
 
+# proc_types is called from head.S to detect the CPU type and call cache_on
 proc_types () at /usr/src/kernel/arch/arm/boot/compressed/head.S:1121
 1121    in /usr/src/kernel/arch/arm/boot/compressed/head.S
 1: x/10i $pc
@@ -147,8 +248,7 @@ entries.
 
 Reference: https://developer.arm.com/documentation/ddi0406/b/
 
-Each 32-bit entry in the first-level translation table is one of four types,
-selected by bits `[1:0]`:
+Each 32-bit entry in the first-level translation table is one of four types,selected by bits `[1:0]`:
 
 [cols="1,1,3", options="header"]
 |===
@@ -174,13 +274,7 @@ selected by bits `[1:0]`:
 
 === Section descriptor bit layout
 
-[source]
-----
- 31        20 19  18 17 16 15  14    12 11  10  9  8      5  4  3  2  1  0
- ┌──────────┬───┬───┬──┬──┬──┬───────┬───────┬──┬─────────┬──┬──┬──┬──┬──┐
- │PA[31:20] │NS │ 0 │nG│ S│AP[2]│TEX[2:0]│AP[1:0]│IMP│Domain│XN│ C│ B│ 1│ 0│
- └──────────┴───┴───┴──┴──┴──┴───────┴───────┴──┴─────────┴──┴──┴──┴──┴──┘
-----
+image::../../images/arm_section_descriptor_bits.svg[]
 
 [cols="1,3", options="header"]
 |===
@@ -237,62 +331,6 @@ selected by bits `[1:0]`:
 | Normal, cacheable + bufferable
 | RAM window: full cache + buffer, executable
 |===
-
----
-
-== `__setup_mmu` — annotated source
-
-[source,armasm]
-----
-__setup_mmu:
-    sub   r3, r4, #16384        @ r3 = r4 - 16 KB  (page-directory base candidate)
-    bic   r3, r3, #0xff         @ \
-    bic   r3, r3, #0x3f00       @  } align r3 DOWN to nearest 16 KB boundary
-
-    /*
-     * Initialise the page tables, turning on cacheable and bufferable
-     * bits for the RAM area only.
-     */
-    mov   r0, r3                @ r0 = write pointer (starts at table base)
-    mov   r9, r0, lsr #18       @ strip low 18 bits
-    mov   r9, r9, lsl #18       @ r9 = RAM start (256 MB-aligned approximation)
-    add   r10, r9, #0x10000000  @ r10 = r9 + 256 MB (assumed RAM end)
-    mov   r1, #0x12             @ descriptor template: bits[1:0]=10 (Section)
-                                @                      bit[4]=1    (XN)
-    orr   r1, r1, #3 << 10     @ AP[11:10] = 0b11 (full access: PL0+PL1 R/W)
-    add   r2, r3, #16384        @ r2 = one-past-end of table (loop sentinel)
-
-1:  cmp   r1,  r9              @ carry CLEAR if r1 < r9 (below RAM)
-    cmphs r10, r1              @ carry CLEAR if r10 <= r1 (at/above RAM end)
-    @   LO (C=0) → outside [r9, r10) → non-RAM
-    @   HS (C=1) → inside  [r9, r10) → RAM
-
-    bic   r1, r1, #0x1c        @ clear bits[4:2]: XN | C | B
-    orrlo r1, r1, #0x10        @ non-RAM: restore XN (bit 4)
-    orrhs r1, r1, r6           @ RAM: apply C/B/TEX from r6 (= 0x0e)
-
-    str   r1, [r0], #4         @ store descriptor, advance r0 by 4
-    add   r1, r1, #1048576     @ r1 += 1 MB (PA base + value both advance)
-    teq   r0, r2               @ reached end of table?
-    bne   1b
-
-    /*
-     * If running from Flash: cache the execution region too.
-     * Map 2 MB so there is no overlap hazard for a 1 MB compressed kernel.
-     * If running from RAM: this duplicates the above — harmless.
-     */
-    orr   r1, r6, #0x04        @ RAM attrs from r6, force B=1
-    orr   r1, r1, #3 << 10     @ AP=11
-    mov   r2, pc               @ capture current PC
-    mov   r2, r2, lsr #20      @ r2 = 1 MB section index of current PC
-    orr   r1, r1, r2, lsl #20  @ embed section base into descriptor
-    add   r0, r3, r2, lsl #2   @ r0 → table slot for PC's section
-    str   r1, [r0], #4         @ patch PC's 1 MB entry
-    add   r1, r1, #1048576     @ advance 1 MB
-    str   r1, [r0]             @ patch PC+1 MB entry
-    mov   pc, lr               @ return to __armv7_mmu_cache_on
-ENDPROC(__setup_mmu)
-----
 
 ---
 
@@ -491,6 +529,9 @@ CPU could not execute from them after the MMU is enabled.
 
 == GDB trace — observed page-table dumps
 
+* 0x40204000 is the page table base address.
+* 0x40208000 is the end of the page table allocation
+
 === Early non-RAM region (`0x40204000`)
 
 [source,gdb]
@@ -661,34 +702,7 @@ those addresses are never accessed during early boot.
 
 == Full 4 GB memory map (post-loop)
 
-[source]
-----
-Virtual / Physical address space  (r9 = 0x40204000, r10 = 0x50204000)
-──────────────────────────────────────────────────────────────────────
-0x00000000 ┬─────────────────────────────────────────────────────────
-           │  Non-RAM  (...c12)
-           │  XN=1, C=0, B=0  —  strongly ordered
-           │  identity mapped  (~1 GB)
-           │
-0x40200000 ├─ lower artefact: descriptor value < r9
-0x402FFFFF │  physically DRAM, mapped non-cached by loop
-           │  (patched to c0e by epilogue if PC falls here)
-           │
-0x40300000 ├─────────────────────────────────────────────────────────
-           │  RAM  (...c0e)
-           │  XN=0, C=1, B=1  —  cacheable + bufferable
-           │  identity mapped  (~254 MB core window)
-           │
-0x50200000 ├─ upper artefact: descriptor value < r10
-0x502FFFFF │  16 KB inside true window; ~1 MB over-mapped cached
-           │
-0x50300000 ├─────────────────────────────────────────────────────────
-           │  Non-RAM  (...c12)
-           │  XN=1, C=0, B=0  —  strongly ordered
-           │  identity mapped  (~3.5 GB)
-           │
-0xFFFFFFFF ┴─────────────────────────────────────────────────────────
-----
+image::../../images/virtual_physical_address_space_map.svg[]
 
 ---
 
@@ -768,56 +782,104 @@ both instruction and data TLBs.
 
 Read-modify-write on the System Control Register:
 
-[cols="2,1,1,3", options="header"]
-|===
-| Instruction | Bit(s) | Direction | Effect
+[source,link]
+----
+Register description: https://developer.arm.com/documentation/ddi0601/2025-12/AArch32-Registers/SCTLR--System-Control-Register
+----
 
-| `bic r0, r0, #1<<28`
-| TRE (28)
-| Clear
-| TEX remap disabled — C/B/TEX bits in descriptors used directly.
-  Critical: `__setup_mmu` encodes direct TEX; leaving TRE set would
-  misinterpret every descriptor.
+[source,gdb]
+----
+(gdb) info registers SCTLR 
+SCTLR          0xc50078            12910712
+(gdb) 
+----
 
-| `orr r0, r0, #0x5000`
-| I-cache (12) + RR (14)
-| Set
-| Instruction cache on; round-robin replacement policy.
-
-| `orr r0, r0, #0x003c`
-| Write buffer (2–5)
-| Set
-| Write buffer and write-allocate controls enabled.
-
-| `bic r0, r0, #2`
-| A (1)
-| Clear
-| Alignment fault on unaligned accesses disabled.
-
-| `orr r0, r0, #1<<22`
-| U (22)
-| Set
-| ARMv6 hardware unaligned access model.  Required for ARM1176.
-|===
+[source,text]
+----
+Bit   Name    Value   Meaning
+----  ------  ------  -------------------------------
+0     M       0       MMU disabled ❌
+1     A       0       Alignment check disabled
+2     C       0       Data cache disabled ❌
+3     W       1       Write buffer enabled
+11    Z       0       Branch prediction disabled
+12    I       1       Instruction cache enabled ✅
+13    V       0       Normal exception vectors (low)
+22    U       1       Unaligned access enabled
+----
 
 ==== Step 4 — Load the MMU hardware registers
 
-[cols="1,1,3", options="header"]
-|===
-| Register | CP15 encoding | Purpose
+* Set TTBR0, DACR, TTBCR registers: Refer arm manula for bit level details.
 
-| `TTBR0`
-| `c2, c0, 0`
-| Physical address of the page table built by `__setup_mmu` (held in `r3`)
+[source,text]
+----
+=> 0x41c7c1c0 <__armv7_mmu_cache_on+104>:       mcrne   15, 0, r3, cr2, cr0, {0}  @ TTBR0 = page-table base (r3)
+   0x41c7c1c4 <__armv7_mmu_cache_on+108>:       mcrne   15, 0, r1, cr3, cr0, {0}  @ DACR  = domain 0 = Client
+   0x41c7c1c8 <__armv7_mmu_cache_on+112>:       mcrne   15, 0, r6, cr2, cr0, {2}  @ TTBCR
+----
 
-| `DACR`
-| `c3, c0, 0`
-| Domain 0 = Client — accesses are checked against page-table permissions
+* GDB dump of the registers to get more details.
 
-| `TTBCR`
-| `c2, c0, 2`
-| Short-descriptor (32-bit) format; only TTBR0 used (N=0, PD0=0)
-|===
+[source,gdb]
+(gdb) info registers TTBR0 DACR TTBCR SCTLR
+TTBR0          0x40204000          1075855360
+DACR           0xfffffffd          -3
+TTBCR          0x0                 0
+SCTLR          0xc5507d            12931197
+(gdb) 
+----
+
+* Explanation of the registers
+
+[source,text]
+----
+SCTLR = 0xC5507D (Key Register)
+Important bits:
+Bit   Name   Value   Meaning
+----  -----  ------  ------------------------------
+0     M      1       MMU enabled ✅
+2     C      1       Data cache enabled ✅
+12    I      1       Instruction cache enabled ✅
+11    Z      0/1     Branch prediction (likely ON)
+1     A      0       Alignment check OFF
+22    U      1       Unaligned access allowed
+✅ Interpretation
+MMU: ON
+I-Cache: ON
+D-Cache: ON
+----
+
+* This confirms:
+You are after MMU + cache enable, likely inside kernel execution.
+
+[source,text]
+----
+# TTBR0 = 0x40204000
+This is the base address of your Level-1 page table (PGD)
+TTBR0 → 0x40204000 → PGD base
+----
+So your page tables live in physical memory around:0x40204000
+
+[source,text]
+----
+# TTBCR = 0x0
+TTBCR = 0 → Full address space uses TTBR0
+----
+Meaning: No split between TTBR0 / TTBR1. Entire VA space uses single translation table
+👉 Typical for: Early Linux boot, Simpler ARM32 setups
+
+[source,text]
+----
+# DACR = 0xFFFFFFFD
+Domain Access Control Register:
+0xFFFFFFFD = 11111111 11111111 11111111 11111101
+Each domain = 2 bits
+Most domains → 11 = Manager mode (no permission checks)
+Domain 0 → 01 = Client mode (uses page permissions)
+----
+
+Meaning: Kernel allows access freely (manager domains). Still respects permissions for domain 0. This is very typical Linux setup
 
 `TTBR0` must be written *before* bit 0 of SCTLR is set.  If the MMU turned
 on before the page-table pointer was valid, the first TLB miss would attempt
@@ -859,25 +921,6 @@ being merged or reordered across the subsequent ISB.
 
 The second ISB guarantees that `mov pc, r12` — and every instruction after it
 — is fetched through the now-active translation table.
-
-=== Why the ordering is mandatory
-
-[source]
-----
-DSB         → page-table writes visible to hardware before MMU loads them
-TLB flush   → no stale translations from previous boot stage
-SCTLR bits  → cacheability model correct BEFORE MMU is turned on
-TTBR0       → page-table pointer valid BEFORE bit 0 of SCTLR is set
-DACR        → domain permissions valid BEFORE first translation walk
-TTBCR       → format/range correct BEFORE first translation walk
-ISB         → pipeline clean BEFORE SCTLR write
-SCTLR write → MMU on — no going back
-read-back   → write forced to complete, not merged with later writes
-ISB         → next fetch (mov pc, r12) uses the MMU
-----
-
-Any reordering of these steps produces undefined behaviour — typically a
-prefetch abort or data abort on the very first post-MMU instruction.
 
 ---
 

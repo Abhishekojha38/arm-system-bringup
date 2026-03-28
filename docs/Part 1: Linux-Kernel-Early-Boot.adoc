@@ -1,4 +1,4 @@
-= ARM32 Linux Boot Process: A Technical Deep-Dive
+= Part 1: Linux Kernel Early Boot
 :toc: left
 :toclevels: 4
 :toc-title: Table of Contents
@@ -1068,7 +1068,7 @@ How to identify a CPU
 Which functions to use for that CPU (cache, MMU, etc.)
 ====
 
-== wont_overwrite: — GOT Fixup, BSS Clear, and Decompression
+== wont_overwrite: — GOT Fixup andBSS Clear
 
 All paths converge at `wont_overwrite:` — whether the decompressor relocated
 itself or arrived here directly.  The C runtime must be prepared before calling
@@ -1248,56 +1248,6 @@ r2             0x426c3b48          1114389320
 (gdb)
 ----
 
-
-
-=== __enter_kernel — Final Register Restore and Jump
-
-[source,armasm]
-----
-__enter_kernel:
-    mov     r0, #0      @ r0 must be 0 (ARM boot ABI)
-    mov     r1, r7      @ restore MachID (saved at entry in Phase 2)
-    mov     r2, r8      @ restore DTB pointer (saved at entry in Phase 2)
-    mov     pc, r4      @ jump to stext at ZRELADDR = 0x40208000
-----
-
-[NOTE]
-====
-At the moment `pc = 0x40208000`, execution is *identical* to a bootloader
-that loaded the uncompressed `vmlinux` directly to `TEXT_OFFSET`.
-The entire decompressor is now irrelevant.
-====
-
-=== Final Memory State at stext
-
-.Physical RAM at the moment PC reaches 0x40208000 (stext)
-image::../../images/diag-after-decompress.png[Final memory state, 680, align=center]
-
-[cols="1,2,4", options="header", width="100%"]
-|===
-| Register | Value | Meaning for vmlinux
-
-| `r0` | `0x00000000` | Must be zero — ARM boot ABI requirement
-| `r1` | `0xFFFFFFFF` | Machine ID (ignored by DT kernels, passed through for legacy)
-| `r2` | `0x48000000` | DTB physical address — parsed by `of_scan_flat_dt()` in `start_kernel`
-| `pc` | `0x40208000` | `stext` — first instruction of `arch/arm/kernel/head.S`
-|===
-
-=== What Happens in vmlinux (stext)
-
-The uncompressed kernel's `arch/arm/kernel/head.S` takes over:
-
-. Enable the MMU and set up initial page tables at `ZRELADDR - 0x4000`.
-. Call `__mmap_switched`: copy `.data` from ROM if needed, clear BSS, set up stack.
-. Call `start_kernel()` in `init/main.c` — printk, scheduler, drivers, filesystems.
-
-[NOTE]
-====
-The appended DTB (`ARM_APPENDED_DTB`) and ATAGs processing code lives *only* in
-the compressed decompressor (`head.S`).  The `vmlinux` `stext` does not look for
-appended DTBs.  If you need this feature you must use a compressed kernel.
-====
-
 === vmlinux Symbols in GDB
 
 To continue tracing into the real kernel, load the uncompressed `vmlinux` symbols
@@ -1308,13 +1258,6 @@ image::../../images/load-symbols-vmlinux.png[Load symbols, 640, align=center]
 
 .GDB showing vmlinux symbols resolved — stext, __irq_svc, etc.
 image::../../images/gdb-vmlinux-symbols.png[GDB vmlinux symbols, 640, align=center]
-
-[source]
-----
-(gdb) add-symbol-file vmlinux 0x40208000
-(gdb) break start_kernel
-(gdb) continue
-----
 
 '''
 
